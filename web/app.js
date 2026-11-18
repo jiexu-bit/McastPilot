@@ -393,6 +393,8 @@
     if (source.loop) sourceMeta.push('循环');
     if (task.realtime === false) sourceMeta.push('不限速');
     if (Number(task.speed) && Number(task.speed) !== 1) sourceMeta.push(task.speed + 'x');
+    const encode = task.encode || {};
+    if (encode.mode === 'transcode') sourceMeta.push('转码 H.264');
     parts.sourceMeta.textContent = sourceMeta.join(' · ');
     parts.sourceMeta.classList.toggle('hidden', !sourceMeta.length);
 
@@ -530,6 +532,13 @@
       ? task.output.extra.map((item) => `${item.group}:${item.port}`).join('\n')
       : '';
     $('fRecord').checked = !!(task && task.record);
+    const encode = task && task.encode ? task.encode : {};
+    $('fEncodeMode').value = encode.mode || 'copy';
+    $('fVideoBitrate').value = encode.video_bitrate || 4000000;
+    $('fAudioBitrate').value = encode.audio_bitrate || 128000;
+    $('fPreset').value = encode.preset || 'veryfast';
+    $('fGop').value = encode.gop || 0;
+    syncEncodeFields();
     $('fAutoRestart').checked = task && task.restart ? task.restart.auto !== false : true;
     $('fMaxRetries').value = task && task.restart ? task.restart.max_retries : 10;
     $('fBackoff').value = task && task.restart ? task.restart.backoff_ms : 1000;
@@ -542,6 +551,13 @@
     if (!node) return;
     node.textContent = message;
     node.classList.remove('hidden');
+  }
+
+  function syncEncodeFields() {
+    const transcode = $('fEncodeMode').value === 'transcode';
+    document.querySelectorAll('.encode-only').forEach((node) => {
+      node.classList.toggle('hidden', !transcode);
+    });
   }
 
   function collectTaskForm() {
@@ -590,7 +606,13 @@
         muxrate: num('fMuxrate', 0),
         cbr: true,
       },
-      encode: { mode: 'copy' },
+      encode: {
+        mode: $('fEncodeMode').value,
+        video_bitrate: num('fVideoBitrate', 4000000),
+        audio_bitrate: num('fAudioBitrate', 128000),
+        preset: $('fPreset').value,
+        gop: num('fGop', 0),
+      },
       restart: {
         auto: $('fAutoRestart').checked,
         max_retries: num('fMaxRetries', 10),
@@ -1053,6 +1075,7 @@
     $('btnToken').addEventListener('click', () => showTokenDialog(''));
     $('btnSaveSettings').addEventListener('click', saveSettings);
     $('sAuthEnabled').addEventListener('change', syncAuthFields);
+    $('fEncodeMode').addEventListener('change', syncEncodeFields);
     $('btnSaveTask').addEventListener('click', (event) => {
       if ($('btnSaveTask').disabled) event.preventDefault();
     });

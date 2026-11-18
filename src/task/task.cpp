@@ -158,6 +158,38 @@ bool ValidateTaskSpec(TaskSpec& spec, std::string& err) {
     if (spec.max_restarts > 1000) spec.max_restarts = 1000;
     if (spec.backoff_ms < 100) spec.backoff_ms = 100;
     if (spec.backoff_ms > 60000) spec.backoff_ms = 60000;
+
+    std::transform(spec.encode_mode.begin(), spec.encode_mode.end(),
+                   spec.encode_mode.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (spec.encode_mode.empty()) spec.encode_mode = "copy";
+    if (spec.encode_mode != "copy" && spec.encode_mode != "transcode") {
+        err = "encode mode must be 'copy' or 'transcode'";
+        return false;
+    }
+    if (spec.video_bitrate < 100000 || spec.video_bitrate > 50000000) {
+        err = "video bitrate must be 100000-50000000";
+        return false;
+    }
+    if (spec.audio_bitrate < 32000 || spec.audio_bitrate > 512000) {
+        err = "audio bitrate must be 32000-512000";
+        return false;
+    }
+    std::transform(spec.preset.begin(), spec.preset.end(), spec.preset.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (spec.preset.empty()) spec.preset = "veryfast";
+    static const std::set<std::string> kPresets = {
+        "ultrafast", "superfast", "veryfast", "faster",
+        "fast",      "medium",    "slow",     "slower",
+    };
+    if (kPresets.count(spec.preset) == 0) {
+        err = "unsupported x264 preset: " + spec.preset;
+        return false;
+    }
+    if (spec.gop < 0 || spec.gop > 600) {
+        err = "gop must be 0-600";
+        return false;
+    }
     return true;
 }
 
@@ -194,7 +226,13 @@ nlohmann::json TaskSpecToJson(const TaskSpec& spec) {
         {"muxrate", spec.muxrate},
         {"cbr", true},
     };
-    json["encode"] = {{"mode", "copy"}};
+    json["encode"] = {
+        {"mode", spec.encode_mode},
+        {"video_bitrate", spec.video_bitrate},
+        {"audio_bitrate", spec.audio_bitrate},
+        {"preset", spec.preset},
+        {"gop", spec.gop},
+    };
     json["restart"] = {
         {"auto", spec.auto_restart},
         {"max_retries", spec.max_restarts},
@@ -273,6 +311,15 @@ bool TaskSpecFromJson(const nlohmann::json& json, TaskSpec& spec, std::string& e
             spec.muxrate = json["mux"].value("muxrate", 0);
         } else {
             spec.muxrate = json.value("muxrate", 0);
+        }
+
+        if (json.contains("encode") && json["encode"].is_object()) {
+            const auto& encode = json["encode"];
+            spec.encode_mode = encode.value("mode", "copy");
+            spec.video_bitrate = encode.value("video_bitrate", 4000000);
+            spec.audio_bitrate = encode.value("audio_bitrate", 128000);
+            spec.preset = encode.value("preset", "veryfast");
+            spec.gop = encode.value("gop", 0);
         }
 
         if (json.contains("restart") && json["restart"].is_object()) {

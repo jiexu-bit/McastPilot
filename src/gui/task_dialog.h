@@ -31,6 +31,7 @@ private:
     void browseLocalFile();
     void probeInput();
     QJsonArray extraOutputs() const;
+    void syncEncodeFields();
 
     ApiClient* api_;
     QJsonArray nics_;
@@ -50,6 +51,11 @@ private:
     QCheckBox* loopback_;
     QPlainTextEdit* extras_;
     QCheckBox* record_;
+    QComboBox* encode_mode_;
+    QSpinBox* video_bitrate_;
+    QSpinBox* audio_bitrate_;
+    QComboBox* preset_;
+    QSpinBox* gop_;
     QCheckBox* auto_restart_;
     QSpinBox* max_retries_;
     QSpinBox* backoff_;

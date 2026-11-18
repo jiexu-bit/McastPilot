@@ -1,7 +1,7 @@
 # McastPilot 交接文档
 
 > 更新时间：2026-11-18
-> 代码状态：**M1、M2、M3 完成；M4 进行中（多目的地 + TS 录制已完成）**
+> 代码状态：**M1、M2、M3 完成；M4 进行中（多目的地 + 录制 + H.264/AAC 转码已完成）**
 > 项目目录：`F:\091-Opencode\推流工具`
 > 工具链目录：`F:\091-Opencode\toolchain\msys64`（项目外，可整体删除）
 
@@ -13,12 +13,12 @@
 |---|---|
 | 做什么 | C++ 写的组播/单播 MPEG-TS 推流工具，替代 VLC 那套繁琐点选配置 |
 | 架构 | C/S：`mcastd` 服务端 + 原生 Web 控制台 + Qt6 桌面客户端 |
-| 现在到哪 | **M1/M2/M3 完成，M4 进行中**：发送内核、CLI、服务端、任务管理、REST/WS、网页端、Qt 桌面端、接收监测、多目的地、TS 录制 |
+| 现在到哪 | **M1/M2/M3 完成，M4 进行中**：发送内核、CLI、服务端、任务管理、REST/WS、网页端、Qt 桌面端、接收监测、多目的地、TS 录制、H.264/AAC 转码 |
 | 产物 | `build\bin\mcastctl.exe`、`build\bin\mcastd.exe`、`build\bin\mcastgui.exe`、`build\bin\web\` |
 | 技术栈 | C++20 / CMake / Ninja / GCC / FFmpeg / cpp-httplib / nlohmann-json / Qt6 / 便携 MSYS2 |
 | 代码量 | `src` 约 7k 行，新增 `task/api/server/gui/web` |
 | 未验证 | **跨机**：B 电脑浏览器/GUI 管理 + VLC 播放仍是唯一未闭环验收项 |
-| 下一步 | M4 剩余：采集/屏幕/转码；协议扩展见 DESIGN 第 15 节 |
+| 下一步 | M4 剩余：采集卡/屏幕捕获；协议扩展见 DESIGN 第 15 节 |
 
 ---
 
@@ -279,6 +279,18 @@ idle → starting → running → stopping → idle
 - Web 表单：额外目的地每行一个 `group:port`；Qt 表单同样有额外目的地和录制开关
 - 增加/删除目的地不需要改发送节奏；只影响 socket 数量与总带宽
 
+### 3.16 H.264/AAC 转码
+
+- 任务字段 `encode.mode`：`copy`（默认）或 `transcode`
+- `transcode` 参数：`video_bitrate`、`audio_bitrate`、`preset`、`gop`
+- `src/media/transcoder.*`：每个音视频流建立 解码器 → swscale/swr → libx264/AAC 编码器，输出到 mpegts
+- 视频统一转 YUV420P H.264，`preset` + `tune=zerolatency`，默认无 B 帧；音频统一 AAC
+- Pipeline 在 transcode 分支用微秒级时间偏移归一化输入时间戳，循环时递增 offset，保证跨循环 PTS 单调
+- CBR：`muxrate=0` 时按 `video_bitrate + 音频码率` 估算；输出仍补空包
+- copy 模式代码路径保持不变，转码是显式开关
+- 新增链接 `libswscale`；要求 FFmpeg 带 libx264/AAC 编码器
+- 当前限制：软件 4K 高帧率可能跟不上实时；无硬件编码、无分辨率缩放
+
 ---
 
 ## 4. 代码地图
@@ -449,6 +461,10 @@ python tests\udp_receiver.py --group 239.1.1.1 --port 5000 --iface <B 的 IP> --
 | 录制 | `recordings/<id>_<时间戳>.ts` 生成 |
 | 录制校验 | ffprobe 识别 HEVC 3440x1440 + AAC |
 | 多目的地失败隔离 | 单个 socket 失败只累计该路错误，其它路继续 |
+| 转码 | 720p H.264 → H.264 2 Mbps/AAC 128k，CBR 3 Mbps，TS/CC 错误 0 |
+| 跨编码 | HEVC 720p → H.264/AAC，ffprobe 输出 H.264 |
+| 转码循环 | 8s 文件连续 12s 跨循环，TS/CC 错误 0 |
+| copy 回归 | copy 模式 4.5 Mbps，0 丢弃/错误 |
 
 ---
 
@@ -477,6 +493,7 @@ python tests\udp_receiver.py --group 239.1.1.1 --port 5000 --iface <B 的 IP> --
 | 19 | 25 Mbps 推流 4 秒后掉到 8 Mbps | `sleep_for(2ms)` 被调度成十几 ms，5ms 突发窗口跟不上 | `PreciseSleep` 使用 Windows 高精度可等待定时器，按 token 缺口精确等待 |
 | 20 | `mcastgui.exe` 双击报缺 `libfreetype-6.dll` | windeployqt 未复制 Qt 的非 Qt 运行时依赖 | 构建后额外复制 freetype/stdc++/icu 等 DLL 到 `build\bin` |
 | 21 | `mcastd.exe` 编译后消失 / Permission denied | 360 杀毒误报 `HEUR/QVM202.0.7E5D.Malware.Gen`，隔离并锁文件 | 把项目 `build` 目录加信任区/白名单，从恢复区“恢复并信任” |
+| 22 | 转码代码在 FFmpeg 9 下编译失败 | `AVCodec::sample_fmts` 已移除、`AVFrame::pkt_duration` 改名 | AAC 固定 `FLTP`，帧时长用 `duration` |
 
 ---
 
@@ -496,6 +513,7 @@ python tests\udp_receiver.py --group 239.1.1.1 --port 5000 --iface <B 的 IP> --
 | P2 | 接收监测单路 | 同一时间只跑一个 UdpReceiver |
 | P2 | 多目的地共享网卡 | 额外目的地沿用主目的地的 NIC/TTL/DSCP/回环 |
 | P2 | 录制无切割/清理 | 原始 CBR TS，文件只增不减 |
+| P2 | 转码为纯软件 | libx264 软件编码；4K 高帧率可能跟不上实时，无硬件编码/缩放 |
 | P2 | 无转码/采集/屏幕 | 输入必须能 copy（M4） |
 | P2 | 仅 IPv4 | 组播/单播均 AF_INET |
 | P2 | 仅 Windows 实测 | Linux 分支在，未编译验证 |
@@ -515,11 +533,11 @@ A 电脑 `--listen 0.0.0.0`，B 电脑：
 - Qt 客户端填 A 的地址，验证任务表、启停、VLC
 - 用 VLC / `tests/udp_receiver.py` 验证组播接收
 
-### 9.2 M4：采集/转码
+### 9.2 M4：采集/屏幕捕获
 
-- 多目的地 + TS 录制已完成
+- 多目的地 + TS 录制 + H.264/AAC 转码已完成
 - 剩余：采集卡、屏幕捕获输入
-- 可选转码（H.264/AAC），解决 RTMP 对 HEVC 的兼容问题
+- 复用现有转码管线（采集设备通常输出未压缩/MJPEG，必须编码）
 - 录制切片/清理、多目的地独立网卡
 
 ### 9.3 协议扩展（M5）

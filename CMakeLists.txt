@@ -24,6 +24,7 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavcodec
     libavutil
     libswresample
+    libswscale
 )
 
 add_library(mcast_core STATIC
@@ -35,6 +36,7 @@ add_library(mcast_core STATIC
     src/net/udp_receiver.cpp
     src/media/pipeline.cpp
     src/media/probe.cpp
+    src/media/transcoder.cpp
 )
 
 target_include_directories(mcast_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")

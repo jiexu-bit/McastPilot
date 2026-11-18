@@ -554,6 +554,11 @@ bool TaskManager::StartLocked(Entry& entry, bool manual, std::string& err) {
         config.record_path =
             PathToUtf8(recordings / (entry.spec.id + "_" + std::to_string(stamp) + ".ts"));
     }
+    config.encode_mode = entry.spec.encode_mode;
+    config.video_bitrate = entry.spec.video_bitrate;
+    config.audio_bitrate = entry.spec.audio_bitrate;
+    config.preset = entry.spec.preset;
+    config.gop = entry.spec.gop;
 
     auto pipeline = std::make_unique<Pipeline>();
     entry.state = "starting";

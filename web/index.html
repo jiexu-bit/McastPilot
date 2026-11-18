@@ -148,6 +148,40 @@
             <span>录制 TS 到服务端数据目录</span>
           </label>
 
+          <div class="section-title full">编码</div>
+          <label class="field">
+            <span>编码模式</span>
+            <select id="fEncodeMode">
+              <option value="copy">copy（不转码）</option>
+              <option value="transcode">H.264 + AAC 转码</option>
+            </select>
+          </label>
+          <label class="field encode-only">
+            <span>视频码率 bps</span>
+            <input id="fVideoBitrate" type="number" value="4000000" min="100000" max="50000000" step="100000">
+          </label>
+          <label class="field encode-only">
+            <span>音频码率 bps</span>
+            <input id="fAudioBitrate" type="number" value="128000" min="32000" max="512000" step="1000">
+          </label>
+          <label class="field encode-only">
+            <span>x264 preset</span>
+            <select id="fPreset">
+              <option value="ultrafast">ultrafast</option>
+              <option value="superfast">superfast</option>
+              <option value="veryfast" selected>veryfast</option>
+              <option value="faster">faster</option>
+              <option value="fast">fast</option>
+              <option value="medium">medium</option>
+              <option value="slow">slow</option>
+              <option value="slower">slower</option>
+            </select>
+          </label>
+          <label class="field encode-only">
+            <span>GOP（0 = 自动）</span>
+            <input id="fGop" type="number" value="0" min="0" max="600">
+          </label>
+
           <div class="section-title full">断流重连</div>
           <label class="check">
             <input id="fAutoRestart" type="checkbox" checked>

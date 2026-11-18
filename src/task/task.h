@@ -24,6 +24,13 @@ struct TaskSpec {
     uint16_t port = 5000;
     std::vector<ExtraOutput> extra_outputs;
     bool record = false;
+
+    // encode.mode = "copy" or "transcode" (H.264 + AAC)
+    std::string encode_mode = "copy";
+    int video_bitrate = 4000000;
+    int audio_bitrate = 128000;
+    std::string preset = "veryfast";
+    int gop = 0;
     std::string nic;
     int ttl = 16;
     int dscp = 0;

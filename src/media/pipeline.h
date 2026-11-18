@@ -17,6 +17,8 @@ struct AVIOContext;
 
 namespace mcast {
 
+class Transcoder;
+
 struct PipelineConfig {
     std::string input;          // file path or URL (rtsp://, udp://, ...)
     bool loop = false;          // restart at EOF (files)
@@ -30,6 +32,11 @@ struct PipelineConfig {
     net::McastConfig mcast;
     std::vector<net::McastConfig> extra_mcasts;
     std::string record_path;    // empty = no recording
+    std::string encode_mode = "copy";
+    int video_bitrate = 4000000;
+    int audio_bitrate = 128000;
+    std::string preset = "veryfast";
+    int gop = 0;
 };
 
 struct PipelineStats {
@@ -78,6 +85,7 @@ private:
     PipelineConfig config_;
     std::unique_ptr<ByteRing> ring_;
     std::vector<std::unique_ptr<net::MulticastSender>> senders_;
+    std::unique_ptr<Transcoder> transcoder_;
     std::ofstream record_file_;
 
     std::thread reader_thread_;

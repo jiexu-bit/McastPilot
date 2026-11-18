@@ -85,6 +85,24 @@ TaskDialog::TaskDialog(ApiClient* api, const QJsonArray& nics, QWidget* parent)
     extras_->setPlaceholderText("额外目的地，每行 group:port，最多 4 个\n例如 239.1.1.2:5000");
     extras_->setMaximumHeight(64);
     record_ = new QCheckBox("录制 TS 到服务端数据目录", this);
+    encode_mode_ = new QComboBox(this);
+    encode_mode_->addItem("copy（不转码）", "copy");
+    encode_mode_->addItem("H.264 + AAC 转码", "transcode");
+    video_bitrate_ = new QSpinBox(this);
+    video_bitrate_->setRange(100000, 50000000);
+    video_bitrate_->setSingleStep(100000);
+    video_bitrate_->setValue(4000000);
+    audio_bitrate_ = new QSpinBox(this);
+    audio_bitrate_->setRange(32000, 512000);
+    audio_bitrate_->setSingleStep(1000);
+    audio_bitrate_->setValue(128000);
+    preset_ = new QComboBox(this);
+    preset_->addItems({"ultrafast", "superfast", "veryfast", "faster", "fast",
+                       "medium", "slow", "slower"});
+    preset_->setCurrentText("veryfast");
+    gop_ = new QSpinBox(this);
+    gop_->setRange(0, 600);
+    gop_->setValue(0);
     auto_restart_ = new QCheckBox("源断开后自动重连", this);
     auto_restart_->setChecked(true);
     max_retries_ = new QSpinBox(this);
@@ -140,6 +158,13 @@ TaskDialog::TaskDialog(ApiClient* api, const QJsonArray& nics, QWidget* parent)
     ++row;
     form->addWidget(record_, row, 1, 1, 3);
     ++row;
+    form->addWidget(new QLabel("编码模式"), row, 0);
+    form->addWidget(encode_mode_, row, 1, 1, 3);
+    ++row;
+    addRow(0, "视频码率 bps", video_bitrate_, 1);
+    addRow(2, "音频码率 bps", audio_bitrate_, 1);
+    addRow(0, "x264 preset", preset_, 1);
+    addRow(2, "GOP（0=自动）", gop_, 1);
     form->addWidget(new QLabel("断流重连"), row, 0);
     form->addWidget(auto_restart_, row, 1);
     ++row;
@@ -160,6 +185,9 @@ TaskDialog::TaskDialog(ApiClient* api, const QJsonArray& nics, QWidget* parent)
     connect(browse_server, &QPushButton::clicked, this, &TaskDialog::browseServerMedia);
     connect(browse_local, &QPushButton::clicked, this, &TaskDialog::browseLocalFile);
     connect(probe, &QPushButton::clicked, this, &TaskDialog::probeInput);
+    connect(encode_mode_, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this](int) { syncEncodeFields(); });
+    syncEncodeFields();
 }
 
 void TaskDialog::populateNics(const QString& selected) {
@@ -211,6 +239,14 @@ void TaskDialog::setTask(const QJsonObject& task) {
     }
     extras_->setPlainText(extra_lines.join('\n'));
     record_->setChecked(task.value("record").toBool());
+    const QJsonObject encode = task.value("encode").toObject();
+    const int mode_index = encode_mode_->findData(encode.value("mode").toString("copy"));
+    if (mode_index >= 0) encode_mode_->setCurrentIndex(mode_index);
+    video_bitrate_->setValue(encode.value("video_bitrate").toInt(4000000));
+    audio_bitrate_->setValue(encode.value("audio_bitrate").toInt(128000));
+    preset_->setCurrentText(encode.value("preset").toString("veryfast"));
+    gop_->setValue(encode.value("gop").toInt(0));
+    syncEncodeFields();
     const QString nic = output.value("nic").toString();
     if (!nic.isEmpty()) {
         const int index = nic_->findData(nic);
@@ -293,6 +329,14 @@ void TaskDialog::probeInput() {
                });
 }
 
+void TaskDialog::syncEncodeFields() {
+    const bool transcode = encode_mode_->currentData().toString() == "transcode";
+    video_bitrate_->setEnabled(transcode);
+    audio_bitrate_->setEnabled(transcode);
+    preset_->setEnabled(transcode);
+    gop_->setEnabled(transcode);
+}
+
 QJsonArray TaskDialog::extraOutputs() const {
     QJsonArray array;
     for (const QString& line : extras_->toPlainText().split('\n')) {
@@ -335,12 +379,19 @@ QJsonObject TaskDialog::body() const {
         {"max_retries", max_retries_->value()},
         {"backoff_ms", backoff_->value()},
     };
+    const QJsonObject encode{
+        {"mode", encode_mode_->currentData().toString()},
+        {"video_bitrate", video_bitrate_->value()},
+        {"audio_bitrate", audio_bitrate_->value()},
+        {"preset", preset_->currentText()},
+        {"gop", gop_->value()},
+    };
     return {
         {"name", name_->text().trimmed()},
         {"source", source},
         {"output", output},
         {"mux", mux},
-        {"encode", QJsonObject{{"mode", "copy"}}},
+        {"encode", encode},
         {"restart", restart},
         {"realtime", realtime_->isChecked()},
         {"speed", speed_->value()},

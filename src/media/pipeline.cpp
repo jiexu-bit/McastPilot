@@ -20,6 +20,7 @@ extern "C" {
 }
 
 #include "common/log.h"
+#include "media/transcoder.h"
 
 namespace mcast {
 namespace {
@@ -99,6 +100,7 @@ bool Pipeline::Start(const PipelineConfig& config, std::string& err) {
     config_ = config;
     if (config_.buffer_bytes < 64 * 1024) config_.buffer_bytes = 64 * 1024;
     if (config_.speed <= 0.0) config_.speed = 1.0;
+    transcoder_.reset();
 
     ring_ = std::make_unique<ByteRing>(config_.buffer_bytes, 188);
 
@@ -229,6 +231,9 @@ void Pipeline::ReaderLoop() {
     int64_t out_shift = 0;      // aligns the earliest PTS/DTS to zero
     int64_t loop_offset = 0;    // grows on every loop, keeps the timeline monotonic
     int64_t last_norm = 0;      // highest normalized DTS written so far
+    int64_t timestamp_offset_us = 0;  // transcode path: normalized timeline in us
+    int64_t last_input_us = 0;        // transcode path: highest normalized input time
+    int64_t pacing_base_us = 0;       // transcode path: start time of current loop
     int64_t wall_start = av_gettime_relative();
     int64_t muxrate = 0;
     int64_t last_write_error_log = 0;
@@ -285,6 +290,7 @@ void Pipeline::ReaderLoop() {
         }
 
         // --------------------------------------------------------- output ---
+        const bool transcode = config_.encode_mode == "transcode";
         ret = avformat_alloc_output_context2(&oc, nullptr, "mpegts", nullptr);
         if (ret < 0 || !oc) {
             error = "mpegts muxer is unavailable: " + AvError(ret);
@@ -292,23 +298,35 @@ void Pipeline::ReaderLoop() {
         }
 
         bool setup_ok = true;
-        for (size_t oi = 0; oi < stream_map.size(); ++oi) {
-            AVStream* in = ic->streams[stream_map[oi]];
-            AVStream* out = avformat_new_stream(oc, nullptr);
-            if (!out) {
+        if (transcode) {
+            TranscodeSettings settings;
+            settings.video_bitrate = config_.video_bitrate;
+            settings.audio_bitrate = config_.audio_bitrate;
+            settings.preset = config_.preset;
+            settings.gop = config_.gop;
+            transcoder_ = std::make_unique<Transcoder>();
+            if (!transcoder_->Configure(ic, stream_map, oc, settings, error)) {
                 setup_ok = false;
-                error = "avformat_new_stream failed";
-                break;
             }
-            if (avcodec_parameters_copy(out->codecpar, in->codecpar) < 0) {
-                setup_ok = false;
-                error = "avcodec_parameters_copy failed";
-                break;
+        } else {
+            for (size_t oi = 0; oi < stream_map.size(); ++oi) {
+                AVStream* in = ic->streams[stream_map[oi]];
+                AVStream* out = avformat_new_stream(oc, nullptr);
+                if (!out) {
+                    setup_ok = false;
+                    error = "avformat_new_stream failed";
+                    break;
+                }
+                if (avcodec_parameters_copy(out->codecpar, in->codecpar) < 0) {
+                    setup_ok = false;
+                    error = "avcodec_parameters_copy failed";
+                    break;
+                }
+                out->codecpar->codec_tag = 0;
+                out->time_base = in->time_base;
+                out->avg_frame_rate = in->avg_frame_rate;
+                out->sample_aspect_ratio = in->sample_aspect_ratio;
             }
-            out->codecpar->codec_tag = 0;
-            out->time_base = in->time_base;
-            out->avg_frame_rate = in->avg_frame_rate;
-            out->sample_aspect_ratio = in->sample_aspect_ratio;
         }
         if (!setup_ok) break;
 
@@ -354,9 +372,21 @@ void Pipeline::ReaderLoop() {
 
         muxrate = config_.muxrate;
         if (muxrate <= 0) {
-            int64_t guess = ic->bit_rate;
-            if (guess <= 0) {
-                for (int index : stream_map) guess += ic->streams[index]->codecpar->bit_rate;
+            int64_t guess = 0;
+            if (transcode) {
+                guess = config_.video_bitrate;
+                for (int index : stream_map) {
+                    if (ic->streams[index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                        guess += config_.audio_bitrate;
+                    }
+                }
+            } else {
+                guess = ic->bit_rate;
+                if (guess <= 0) {
+                    for (int index : stream_map) {
+                        guess += ic->streams[index]->codecpar->bit_rate;
+                    }
+                }
             }
             if (guess <= 0) guess = 8000000;
             muxrate = static_cast<int64_t>(static_cast<double>(guess) * 1.15);
@@ -364,10 +394,11 @@ void Pipeline::ReaderLoop() {
         }
         rate_bps_.store(muxrate, std::memory_order_relaxed);
 
-        LOG_INFO("output: mpegts CBR %.3f Mbps -> %s:%u, pkt=%d B, ring=%llu KB",
+        LOG_INFO("output: mpegts CBR %.3f Mbps -> %s:%u, pkt=%d B, ring=%llu KB%s",
                  static_cast<double>(muxrate) / 1e6, config_.mcast.group.c_str(),
                  static_cast<unsigned>(config_.mcast.port), config_.pkt_size,
-                 static_cast<unsigned long long>(config_.buffer_bytes / 1024));
+                 static_cast<unsigned long long>(config_.buffer_bytes / 1024),
+                 transcode ? " (transcode H.264/AAC)" : " (copy)");
         if (!config_.record_path.empty()) {
             LOG_INFO("recording: %s", config_.record_path.c_str());
         }
@@ -400,7 +431,23 @@ void Pipeline::ReaderLoop() {
         }
         header_written = true;
 
-        if (start_us != AV_NOPTS_VALUE && oc->nb_streams > 0) {
+        auto write_encoded = [&oc](int, AVPacket* out) -> bool {
+            return av_interleaved_write_frame(oc, out) >= 0;
+        };
+        auto adjust_input_ts = [&](int64_t ts, const AVStream* stream) {
+            if (ts == AV_NOPTS_VALUE) return ts;
+            const int64_t us =
+                av_rescale_q(ts, stream->time_base, AV_TIME_BASE_Q) + timestamp_offset_us;
+            return av_rescale_q(us, AV_TIME_BASE_Q, stream->time_base);
+        };
+
+        if (transcode) {
+            const int64_t start = start_us == AV_NOPTS_VALUE ? 0 : start_us;
+            timestamp_offset_us = -start;
+            last_input_us = 0;
+            LOG_INFO("transcode: H.264 %d bps, AAC %d bps, preset %s",
+                     config_.video_bitrate, config_.audio_bitrate, config_.preset.c_str());
+        } else if (start_us != AV_NOPTS_VALUE && oc->nb_streams > 0) {
             out_shift = -av_rescale_q(start_us, AV_TIME_BASE_Q, oc->streams[0]->time_base);
             LOG_INFO("timestamp alignment: %lld ticks (start %.3f s)",
                      static_cast<long long>(out_shift),
@@ -419,7 +466,13 @@ void Pipeline::ReaderLoop() {
                         break;
                     }
                     avformat_flush(ic);
-                    loop_offset = last_norm + 1;
+                    if (transcode) {
+                        const int64_t start = start_us == AV_NOPTS_VALUE ? 0 : start_us;
+                        timestamp_offset_us = last_input_us + 1000 - start;
+                        pacing_base_us = last_input_us + 1000;
+                    } else {
+                        loop_offset = last_norm + 1;
+                    }
                     wall_start = av_gettime_relative();
                     av_packet_unref(pkt);
                     continue;
@@ -446,50 +499,91 @@ void Pipeline::ReaderLoop() {
             }
 
             AVStream* ist = ic->streams[pkt->stream_index];
-            AVStream* ost = oc->streams[out_index];
 
-            av_packet_rescale_ts(pkt, ist->time_base, ost->time_base);
-            const int64_t shift = out_shift + loop_offset;
-            if (pkt->dts != AV_NOPTS_VALUE) pkt->dts += shift;
-            if (pkt->pts != AV_NOPTS_VALUE) pkt->pts += shift;
-            pkt->stream_index = out_index;
-            pkt->pos = -1;
-
-            const int64_t norm_dts = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
-            if (norm_dts != AV_NOPTS_VALUE) {
-                last_norm = std::max(last_norm, norm_dts);
-
-                if (config_.realtime) {
-                    const int64_t relative = norm_dts - loop_offset;
-                    const double seconds =
-                        static_cast<double>(relative) * av_q2d(ost->time_base) / config_.speed;
-                    const int64_t target_us = wall_start + static_cast<int64_t>(seconds * 1e6);
-                    const int64_t now_us = av_gettime_relative();
-                    if (target_us > now_us) {
-                        SleepInterruptible(target_us - now_us);
-                    } else if (now_us - target_us > 10000000) {
-                        // Timestamps jumped; resync instead of bursting.
-                        wall_start = now_us - static_cast<int64_t>(seconds * 1e6);
+            if (transcode) {
+                pkt->pts = adjust_input_ts(pkt->pts, ist);
+                pkt->dts = adjust_input_ts(pkt->dts, ist);
+                const int64_t norm_ts = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+                if (norm_ts != AV_NOPTS_VALUE) {
+                    const int64_t norm_us =
+                        av_rescale_q(norm_ts, ist->time_base, AV_TIME_BASE_Q);
+                    last_input_us = std::max(last_input_us, norm_us);
+                    if (config_.realtime) {
+                        const int64_t relative_us = norm_us - pacing_base_us;
+                        const double seconds =
+                            static_cast<double>(relative_us) / 1e6 / config_.speed;
+                        const int64_t target_us =
+                            wall_start + static_cast<int64_t>(seconds * 1e6);
+                        const int64_t now_us = av_gettime_relative();
+                        if (target_us > now_us) {
+                            SleepInterruptible(target_us - now_us);
+                        } else if (now_us - target_us > 10000000) {
+                            wall_start = now_us - static_cast<int64_t>(seconds * 1e6);
+                        }
                     }
                 }
-            }
-
-            ret = av_interleaved_write_frame(oc, pkt);
-            if (ret < 0) {
-                const int64_t now = av_gettime_relative();
-                if (now - last_write_error_log > 2000000) {
-                    LOG_WARN("write frame failed: %s", AvError(ret).c_str());
-                    last_write_error_log = now;
+                if (!transcoder_->Process(pkt, write_encoded, error)) {
+                    break;
                 }
+                frames_.fetch_add(1, std::memory_order_relaxed);
+                av_packet_unref(pkt);
+            } else {
+                AVStream* ost = oc->streams[out_index];
+                av_packet_rescale_ts(pkt, ist->time_base, ost->time_base);
+                const int64_t shift = out_shift + loop_offset;
+                if (pkt->dts != AV_NOPTS_VALUE) pkt->dts += shift;
+                if (pkt->pts != AV_NOPTS_VALUE) pkt->pts += shift;
+                pkt->stream_index = out_index;
+                pkt->pos = -1;
+
+                const int64_t norm_dts = pkt->dts != AV_NOPTS_VALUE ? pkt->dts : pkt->pts;
+                if (norm_dts != AV_NOPTS_VALUE) {
+                    last_norm = std::max(last_norm, norm_dts);
+
+                    if (config_.realtime) {
+                        const int64_t relative = norm_dts - loop_offset;
+                        const double seconds =
+                            static_cast<double>(relative) * av_q2d(ost->time_base) /
+                            config_.speed;
+                        const int64_t target_us =
+                            wall_start + static_cast<int64_t>(seconds * 1e6);
+                        const int64_t now_us = av_gettime_relative();
+                        if (target_us > now_us) {
+                            SleepInterruptible(target_us - now_us);
+                        } else if (now_us - target_us > 10000000) {
+                            // Timestamps jumped; resync instead of bursting.
+                            wall_start = now_us - static_cast<int64_t>(seconds * 1e6);
+                        }
+                    }
+                }
+
+                ret = av_interleaved_write_frame(oc, pkt);
+                if (ret < 0) {
+                    const int64_t now = av_gettime_relative();
+                    if (now - last_write_error_log > 2000000) {
+                        LOG_WARN("write frame failed: %s", AvError(ret).c_str());
+                        last_write_error_log = now;
+                    }
+                }
+                frames_.fetch_add(1, std::memory_order_relaxed);
+                av_packet_unref(pkt);
             }
-            frames_.fetch_add(1, std::memory_order_relaxed);
-            av_packet_unref(pkt);
 
             if (config_.duration_ms > 0 &&
                 (av_gettime_relative() - started_us_) / 1000 >= config_.duration_ms) {
                 LOG_INFO("duration reached, stopping");
                 break;
             }
+        }
+
+        if (error.empty() && transcoder_ && header_written) {
+            if (!transcoder_->Flush(write_encoded, error)) {
+                LOG_ERROR("transcoder flush failed: %s", error.c_str());
+            }
+        }
+        if (transcoder_) {
+            transcoder_->Close();
+            transcoder_.reset();
         }
 
         LOG_INFO("stream loop finished");

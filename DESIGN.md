@@ -220,7 +220,13 @@
     "muxrate": 8000000,
     "cbr": true
   },
-  "encode": { "mode": "copy" },
+  "encode": {
+    "mode": "copy",
+    "video_bitrate": 4000000,
+    "audio_bitrate": 128000,
+    "preset": "veryfast",
+    "gop": 0
+  },
   "restart": { "auto": true, "max_retries": 10, "backoff_ms": 1000 }
 }
 ```
@@ -323,7 +329,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 | **M1** | 网卡枚举 + 组播/单播发送 + FFmpeg 封装 + CLI | 完成（本机回环；跨机待测） | `mcastctl send ...` 后另一台机器 VLC 稳定播放，码率/丢包可见 |
 | **M2** | 服务端 + REST/WS + 任务持久化 + 网页端 + 接收监测 | 完成（本机联调；跨机待测） | 浏览器新建任务、启停、实时曲线；服务重启任务保留；两路并发；路径穿越拒绝；断流恢复 |
 | **M3** | Qt6 桌面客户端 | 完成（本机验证核心链路） | 网卡下拉、任务列表、一键启停、状态卡片、日志/监测、VLC |
-| **M4** | 采集/屏幕/转码/录制/多目的地 | 进行中：多目的地 + TS 录制已完成 | 采集卡推流、同时推两个组播、录制存档 |
+| **M4** | 采集/屏幕/转码/录制/多目的地 | 进行中：多目的地 + TS 录制 + H.264/AAC 转码已完成 | 采集卡推流、同时推两个组播、录制存档 |
 | **M5** | 更多输出协议：RTMP/SRT/RTSP/HLS | 待开始 | 同一任务可切换协议；RTMP/SRT 推流可被服务端稳定接收 |
 
 ---
@@ -478,5 +484,22 @@ Pipeline（解封装/封装）
 ### 17.3 后续
 
 - 采集卡 / 屏幕捕获输入
-- 转码（H.264/AAC）与 RTMP 兼容
+- 硬件编码、分辨率缩放
 - 多目的地独立网卡、录制切片/清理
+
+---
+
+## 18. M4 第二批：H.264/AAC 转码
+
+- 任务字段 `encode.mode`：`copy` 或 `transcode`；参数 `video_bitrate/audio_bitrate/preset/gop`
+- `src/media/transcoder.*`：
+  - 每个音视频流：解码 → swscale/swr → libx264/AAC 编码
+  - 视频固定 YUV420P，`preset + tune=zerolatency`，默认无 B 帧
+  - 音频统一 AAC，采样率/声道沿用输入
+- Pipeline 增加 transcode 分支：
+  - 输入包先按微秒偏移归一化，循环时递增偏移，保证跨循环 PTS 单调
+  - 编码包通过现有 muxer/ring/多目的地/录制链路发送
+  - `muxrate=0` 时按 `video_bitrate + 音频码率` 估算 CBR
+- copy 路径保持原样，转码是显式开关
+- 新增依赖：`libswscale`；FFmpeg 需带 libx264 与 AAC 编码器
+- 当前为纯软件编码，4K 高帧率可能无法实时；硬件编码/缩放留后续
