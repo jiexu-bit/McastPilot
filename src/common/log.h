@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdarg>
+#include <functional>
+#include <string>
 
 namespace mcast {
 
@@ -17,12 +19,29 @@ void SetLogLevel(LogLevel level);
 LogLevel GetLogLevel();
 bool ParseLogLevel(const char* text, LogLevel& out);
 
-// Thread-safe, writes one line to stderr.
+// Optional sink used by the daemon to mirror logs to a file, per-task ring
+// buffers and WebSocket clients. The callback must be thread-safe and must not
+// log recursively.
+using LogSink = std::function<void(LogLevel, const std::string& context,
+                                   const std::string& line)>;
+void SetLogSink(LogSink sink);
+
+// Task id attached to log lines emitted by the current thread. Pipeline reader
+// and sender threads set this so per-task logs can be routed without changing
+// every call site.
+void SetThreadLogContext(const std::string& context);
+std::string ThreadLogContext();
+
+// Thread-safe, writes one line to stderr and forwards to the sink.
 void LogWrite(LogLevel level, const char* file, int line, const char* fmt, ...)
 #if defined(__GNUC__)
     __attribute__((format(printf, 4, 5)))
 #endif
     ;
+
+// For messages produced by external libraries (FFmpeg) that already contain a
+// formatted line.
+void LogExternal(LogLevel level, const std::string& message);
 
 }  // namespace mcast
 

@@ -28,9 +28,14 @@ void ByteRing::PushUnlocked(const uint8_t* data, size_t len) {
 
     size_t free_space = capacity_ - size_;
     if (len > free_space) {
-        size_t drop = len - free_space;
-        drop -= drop % drop_granularity_;
-        if (drop == 0) drop = len - free_space;  // pathological, keep behaviour
+        // Drop at least the shortfall, rounded *up* to the protocol granularity.
+        // Rounding down (the old behaviour) left less free space than requested
+        // and let size_ grow past capacity_ under sustained overflow.
+        const size_t need = len - free_space;
+        size_t drop =
+            ((need + drop_granularity_ - 1) / drop_granularity_) * drop_granularity_;
+        if (drop > size_) drop = size_;
+        if (drop == 0) drop = 1;
         head_ = (head_ + drop) % capacity_;
         size_ -= drop;
         dropped_.fetch_add(drop, std::memory_order_relaxed);

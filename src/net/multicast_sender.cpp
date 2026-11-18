@@ -35,6 +35,17 @@ bool MulticastSender::Open(const McastConfig& config, std::string& err) {
     Close();
     config_ = config;
 
+    // Counters belong to one run of the pipeline. Reset them here (not in
+    // Close) so callers can still inspect the final stats after Stop().
+    bytes_.store(0, std::memory_order_relaxed);
+    packets_.store(0, std::memory_order_relaxed);
+    drops_.store(0, std::memory_order_relaxed);
+    errors_.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(error_mutex_);
+        last_error_.clear();
+    }
+
     if (config_.group.empty() || config_.port == 0) {
         err = "multicast group/port is empty";
         return false;

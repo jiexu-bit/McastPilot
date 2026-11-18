@@ -6,6 +6,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <vector>
 
@@ -52,19 +53,20 @@ const char* MediaTypeName(AVMediaType type) {
 // as-is. The output still decodes cleanly, but the message would flood the log
 // at ~40 lines/s, so filter exactly that line and keep everything else.
 void FfmpegLogCallback(void* ptr, int level, const char* fmt, va_list args) {
+    (void)ptr;
     if (level > av_log_get_level()) return;
     char line[1024];
     std::vsnprintf(line, sizeof(line), fmt, args);
     if (std::strstr(line, "dts < pcr, TS is invalid") != nullptr) return;
     if (level <= AV_LOG_WARNING) {
-        std::fputs(line, stderr);
-        std::fflush(stderr);
+        LogExternal(level <= AV_LOG_ERROR ? LogLevel::Error : LogLevel::Warn, line);
     }
 }
 
 void InstallFfmpegLogFilter() {
     static std::once_flag once;
     std::call_once(once, [] {
+        avformat_network_init();
         av_log_set_level(AV_LOG_WARNING);
         av_log_set_callback(&FfmpegLogCallback);
     });
@@ -99,9 +101,48 @@ bool Pipeline::Start(const PipelineConfig& config, std::string& err) {
     if (config_.speed <= 0.0) config_.speed = 1.0;
 
     ring_ = std::make_unique<ByteRing>(config_.buffer_bytes, 188);
-    if (!sender_.Open(config_.mcast, err)) {
+
+    senders_.clear();
+    senders_.reserve(1 + config_.extra_mcasts.size());
+    auto open_sender = [this, &err](const net::McastConfig& mcast) -> bool {
+        auto sender = std::make_unique<net::MulticastSender>();
+        std::string open_error;
+        if (!sender->Open(mcast, open_error)) {
+            err = "cannot open output " + mcast.group + ":" + std::to_string(mcast.port) +
+                  ": " + open_error;
+            return false;
+        }
+        senders_.push_back(std::move(sender));
+        return true;
+    };
+    if (!open_sender(config_.mcast)) {
         ring_.reset();
+        senders_.clear();
         return false;
+    }
+    for (const net::McastConfig& extra : config_.extra_mcasts) {
+        if (!open_sender(extra)) {
+            for (auto& sender : senders_) sender->Close();
+            senders_.clear();
+            ring_.reset();
+            return false;
+        }
+    }
+
+    record_file_.close();
+    record_file_.clear();
+    recorded_bytes_.store(0);
+    if (!config_.record_path.empty()) {
+        const std::u8string utf8(config_.record_path.begin(), config_.record_path.end());
+        record_file_.open(std::filesystem::path(utf8),
+                          std::ios::binary | std::ios::trunc);
+        if (!record_file_.is_open()) {
+            err = "cannot open recording file: " + config_.record_path;
+            for (auto& sender : senders_) sender->Close();
+            senders_.clear();
+            ring_.reset();
+            return false;
+        }
     }
 
     frames_.store(0);
@@ -126,7 +167,9 @@ void Pipeline::Stop() {
     if (ring_) ring_->Close();
     if (reader_thread_.joinable()) reader_thread_.join();
     if (sender_thread_.joinable()) sender_thread_.join();
-    sender_.Close();
+    record_file_.close();
+    for (auto& sender : senders_) sender->Close();
+    senders_.clear();
     ring_.reset();
 }
 
@@ -145,6 +188,16 @@ int Pipeline::WriteCallback(void* opaque, const uint8_t* buf, int size) {
     if (!self->ring_ || size <= 0) return 0;
     const size_t written = self->ring_->Write(buf, static_cast<size_t>(size));
     self->muxed_bytes_.fetch_add(written, std::memory_order_relaxed);
+    if (self->record_file_.is_open()) {
+        self->record_file_.write(reinterpret_cast<const char*>(buf), size);
+        if (self->record_file_) {
+            self->recorded_bytes_.fetch_add(static_cast<uint64_t>(size),
+                                            std::memory_order_relaxed);
+        } else {
+            LOG_WARN("recording write failed, recording stopped");
+            self->record_file_.close();
+        }
+    }
     // Always report success: loss is accounted for by the ring, and returning
     // an error here would abort the muxer instead of degrading gracefully.
     return size;
@@ -161,6 +214,7 @@ void Pipeline::SetError(const std::string& message) {
 }
 
 void Pipeline::ReaderLoop() {
+    SetThreadLogContext(config_.log_tag);
     InstallFfmpegLogFilter();
 
     AVFormatContext* ic = nullptr;
@@ -314,6 +368,9 @@ void Pipeline::ReaderLoop() {
                  static_cast<double>(muxrate) / 1e6, config_.mcast.group.c_str(),
                  static_cast<unsigned>(config_.mcast.port), config_.pkt_size,
                  static_cast<unsigned long long>(config_.buffer_bytes / 1024));
+        if (!config_.record_path.empty()) {
+            LOG_INFO("recording: %s", config_.record_path.c_str());
+        }
 
         constexpr int kIoBufferSize = 32768;
         auto* io_buffer = static_cast<uint8_t*>(av_malloc(kIoBufferSize));
@@ -452,10 +509,12 @@ void Pipeline::ReaderLoop() {
     }
     running_.store(false, std::memory_order_relaxed);
     if (ring_) ring_->Close();
+    SetThreadLogContext({});
 }
 
 void Pipeline::SenderLoop() {
-    if (!ring_) return;
+    SetThreadLogContext(config_.log_tag);
+    if (!ring_ || senders_.empty()) return;
 
     const int pkt_size = std::clamp(config_.pkt_size, 188, 65507);
     std::vector<uint8_t> buffer(static_cast<size_t>(pkt_size));
@@ -503,31 +562,54 @@ void Pipeline::SenderLoop() {
 
             const size_t len = n - offset;
             budget -= static_cast<double>(len);
-            sender_.Send(buffer.data() + offset, len);
+            for (auto& sender : senders_) {
+                sender->Send(buffer.data() + offset, len);
+            }
             ++sent;
         }
 
         if (sent == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            int64_t wait_us = 2000;
+            if (ring_ && ring_->Size() > 0) {
+                const double deficit =
+                    static_cast<double>(pkt_size) - std::max(0.0, budget);
+                wait_us = static_cast<int64_t>(deficit / bytes_per_second * 1e6);
+                wait_us = std::clamp<int64_t>(wait_us, 200, 2000);
+            }
+            net::PreciseSleep(wait_us);
         }
     }
 
     if (unsync > 0) {
         LOG_WARN("sender skipped %llu non-TS chunks", static_cast<unsigned long long>(unsync));
     }
+    SetThreadLogContext({});
 }
 
 PipelineStats Pipeline::Snapshot() const {
     PipelineStats stats;
     stats.running = running_.load(std::memory_order_relaxed);
 
-    const net::SenderStats sender = sender_.Stats();
+    uint64_t output_bytes = 0;
+    uint64_t packets_sent = 0;
+    uint64_t packets_dropped = 0;
+    uint64_t send_errors = 0;
+    for (const auto& sender : senders_) {
+        const net::SenderStats stats = sender->Stats();
+        output_bytes += stats.bytes;
+        packets_sent += stats.packets;
+        packets_dropped += stats.drops;
+        send_errors += stats.errors;
+    }
+
     stats.muxed_bytes = muxed_bytes_.load(std::memory_order_relaxed);
+    stats.recorded_bytes = recorded_bytes_.load(std::memory_order_relaxed);
+    stats.destinations = senders_.size();
     stats.muxrate_bps = rate_bps_.load(std::memory_order_relaxed);
-    stats.output_bytes = sender.bytes;
-    stats.packets_sent = sender.packets;
-    stats.send_errors = sender.errors;
-    stats.packets_dropped = sender.drops;
+    stats.output_bytes = output_bytes;
+    stats.packets_sent = packets_sent;
+    stats.send_errors = send_errors;
+    stats.packets_dropped = packets_dropped;
     stats.buffer_drop_bytes = ring_ ? ring_->DroppedBytes() : 0;
     stats.frames = frames_.load(std::memory_order_relaxed);
 
@@ -545,11 +627,11 @@ PipelineStats Pipeline::Snapshot() const {
     stats.elapsed_sec = started_us_ > 0 ? static_cast<double>(now - started_us_) / 1e6 : 0.0;
 
     const int64_t previous_us = sample_us_.exchange(now);
-    const uint64_t previous_bytes = sample_bytes_.exchange(sender.bytes);
-    if (previous_us > 0 && now > previous_us && sender.bytes >= previous_bytes) {
+    const uint64_t previous_bytes = sample_bytes_.exchange(output_bytes);
+    if (previous_us > 0 && now > previous_us && output_bytes >= previous_bytes) {
         const double seconds = static_cast<double>(now - previous_us) / 1e6;
         const double mbps =
-            static_cast<double>(sender.bytes - previous_bytes) * 8.0 / seconds / 1e6;
+            static_cast<double>(output_bytes - previous_bytes) * 8.0 / seconds / 1e6;
         bitrate_mbps_.store(mbps, std::memory_order_relaxed);
     }
     stats.bitrate_mbps = bitrate_mbps_.load(std::memory_order_relaxed);

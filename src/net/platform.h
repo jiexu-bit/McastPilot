@@ -19,6 +19,7 @@
 #include <unistd.h>
 #endif
 
+#include <cstdint>
 #include <string>
 
 namespace mcast::net {
@@ -34,6 +35,11 @@ inline constexpr Socket kInvalidSocket = -1;
 // Windows requires WSAStartup before any socket call. No-op on POSIX.
 bool InitSockets(std::string& err);
 void ShutdownSockets();
+
+// High-resolution sleep used by the send pacer. On Windows this uses a
+// CREATE_WAITABLE_TIMER_HIGH_RESOLUTION timer instead of Sleep(), which can be
+// rounded up to the 15.6 ms scheduler tick under load.
+void PreciseSleep(int64_t microseconds);
 
 std::string SocketErrorText(int code);
 

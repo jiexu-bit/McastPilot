@@ -1,7 +1,7 @@
 # McastPilot 交接文档
 
 > 更新时间：2026-11-18
-> 代码状态：**M1 完成，可构建、可运行、已实测**
+> 代码状态：**M1、M2、M3 完成；M4 进行中（多目的地 + TS 录制已完成）**
 > 项目目录：`F:\091-Opencode\推流工具`
 > 工具链目录：`F:\091-Opencode\toolchain\msys64`（项目外，可整体删除）
 
@@ -11,246 +11,323 @@
 
 | 项 | 内容 |
 |---|---|
-| 做什么 | 用 C++ 写的组播/单播 MPEG-TS 推流工具，替代 VLC 那套繁琐的点选配置 |
-| 架构 | C/S：`mcastd` 服务端 + Qt 桌面端 + 可选 Web 端（M2 起） |
-| 现在到哪 | **M1 完成**：网卡枚举、组播/单播发送、FFmpeg 封装、CBR 节奏、实时统计、CLI |
-| 产物 | `build\bin\mcastctl.exe`（唯一可执行文件） |
-| 技术栈 | C++20 / CMake 4.4 / Ninja / GCC 16.2 / FFmpeg 9.0 / 便携 MSYS2 UCRT64 / Qt 6.12（已装未用） |
-| 代码量 | 约 2100 行，`src` 下 5 个模块 |
-| 实测 | 4.5 Mbps CBR，接收 4.22 Mbps，TS 同步错误 0，CC 连续性错误 0，FFmpeg 解码通过 |
-| 未验证 | **跨机（第二台电脑）实播**——这是 M1 唯一没闭环的验收项 |
-| 下一步 | M2：服务端 + REST/WS + 网页端 + 接收监测（见第 9 节） |
+| 做什么 | C++ 写的组播/单播 MPEG-TS 推流工具，替代 VLC 那套繁琐点选配置 |
+| 架构 | C/S：`mcastd` 服务端 + 原生 Web 控制台 + Qt6 桌面客户端 |
+| 现在到哪 | **M1/M2/M3 完成，M4 进行中**：发送内核、CLI、服务端、任务管理、REST/WS、网页端、Qt 桌面端、接收监测、多目的地、TS 录制 |
+| 产物 | `build\bin\mcastctl.exe`、`build\bin\mcastd.exe`、`build\bin\mcastgui.exe`、`build\bin\web\` |
+| 技术栈 | C++20 / CMake / Ninja / GCC / FFmpeg / cpp-httplib / nlohmann-json / Qt6 / 便携 MSYS2 |
+| 代码量 | `src` 约 7k 行，新增 `task/api/server/gui/web` |
+| 未验证 | **跨机**：B 电脑浏览器/GUI 管理 + VLC 播放仍是唯一未闭环验收项 |
+| 下一步 | M4 剩余：采集/屏幕/转码；协议扩展见 DESIGN 第 15 节 |
 
 ---
 
-## 1. 需求边界（已和需求方确认）
+## 1. 需求边界（已确认）
 
 | 问题 | 结论 |
 |---|---|
-| 平台 | Windows 优先，网络层做抽象，后续可编 Linux |
-| 推流引擎 | FFmpeg，**进程内链接** `libavformat/libavcodec`，不调 `ffmpeg.exe` |
-| 输入源 | 本地文件循环、采集卡、屏幕捕获、已有网络流转推（M4 补齐采集/屏幕） |
-| 输出 | UDP 组播 MPEG-TS（核心）、UDP 单播、RTMP/RTSP/SRT、录制、多目的地（M4） |
-| 客户端 | **Qt 桌面 GUI 为主**，可选 Web 端（可开关），给 B 电脑远程配置 |
+| 平台 | Windows 优先，网络层抽象，后续可编 Linux |
+| 推流引擎 | FFmpeg，进程内链接，不调 `ffmpeg.exe` |
+| 输入源 | 本地文件循环、网络流转推（M4 补采集/屏幕） |
+| 输出 | UDP 组播（核心）、UDP 单播；RTMP/RTSP/SRT、录制、多目的地属 M4 |
+| 客户端 | **Qt 桌面 GUI 为主**（M3 已完成），Web 为可选远程端（M2 已完成） |
 | 部署 | 先同机，协议按跨机设计 |
-| 组播能力 | 指定网卡/源 IP、TTL、DSCP、组播回环开关、CBR、自动重连、多路并发 |
-| 转码 | 默认 `copy`，不转码 |
+| 组播能力 | 指定网卡/源 IP、TTL、DSCP、回环、CBR、自动重连、多路并发 |
+| 转码 | 默认 `copy` |
 | 规模 | ≤5 路，每路 ≤20 Mbps |
-| 文件选择 | 网页端只浏览服务端**白名单目录**，只读，不上传 |
-| 工具链 | 便携 MSYS2 UCRT64，无管理员、不动系统、可一键删除 |
+| 文件选择 | 网页只浏览服务端白名单目录，只读 |
+| 工具链 | 便携 MSYS2 UCRT64，无管理员、可一键删除 |
 
 ---
 
 ## 2. 架构
 
-### 2.1 目标架构（完整形态）
+### 2.1 组成
 
 ```
 ┌──────────────────────────────┐         ┌──────────────────────────────┐
-│  mcastgui (Qt6 Widgets)      │         │  Browser (B 电脑 / 手机)      │
-│  · 网卡 / 预设 / 状态面板      │         │  · 同一套 REST + WebSocket    │
+│  mcastgui (Qt6)               │         │  Browser (本机 / B 电脑)      │
 └──────────────┬───────────────┘         └──────────────┬───────────────┘
                │  HTTP/JSON + WebSocket                │
                └───────────────┬───────────────────────┘
                                ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│  mcastd  (服务端，无界面，可做 Windows 服务 / 前台 --console)          │
-│                                                                      │
-│  api/       REST + WebSocket + 静态页 + token 认证                    │
-│  task/      任务模型、状态机、持久化、调度、日志                        │
-│  media/     输入(文件/网络/设备) → 解封装 → [转码] → TS 封装 → 节奏     │
-│  net/       网卡枚举、组播发送、组播接收、统计                          │
-│  common/    字节环形缓冲、日志、配置、工具                             │
+│  mcastd                                                              │
+│  api/      REST + WS + 静态页 + token 鉴权                            │
+│  task/     任务模型、状态机、持久化、1Hz 采样、自动重连、任务日志       │
+│  media/    FFmpeg 输入 → mpegts CBR → 节奏                            │
+│  net/      网卡、组播/单播发送、UDP/TS 接收监测、统计                  │
+│  common/   环形缓冲、日志、配置、滚动文件日志                          │
 └──────────────────────────────────────────────────────────────────────┘
-                               │
-                               ▼  MPEG-TS / UDP
+                               │  MPEG-TS / UDP
                      239.x.x.x:5000  ──────────►  VLC / 机顶盒 / 解码器
 ```
 
-### 2.2 当前实现（M1）
+### 2.2 进程与线程
 
-M1 没有服务端，`mcastctl` 把「任务」直接跑在自己进程里，方便先验证最难的发送链路：
+| 进程 | 职责 |
+|---|---|
+| `mcastctl` | CLI 单次推流，直接持有 Pipeline |
+| `mcastd` | 常驻服务端，持有任务表、HTTP/WS、多个 Pipeline |
 
-```
-mcastctl.exe
-  ├ 解析参数 / 枚举网卡
-  ├ Pipeline
-  │   ├ 读线程：avformat 解封装 → mpegts 封装（CBR）→ 写环形缓冲
-  │   └ 发线程：令牌桶节奏 → UDP sendto（组播/单播）
-  └ 主线程：每秒打印统计
-```
+`mcastd` 线程：
 
-M2 会把 `Pipeline` 原样搬进 `mcastd`，外面套任务管理和 HTTP API，发送层不用改。
+| 线程 | 职责 |
+|---|---|
+| 主线程 | 参数、配置、信号、启动/停止服务 |
+| HTTP/WS 线程池 | cpp-httplib 默认线程池，处理 REST 和 WebSocket |
+| TaskManager worker | 1Hz：采样统计、检测断流、自动重连、广播状态 |
+| 每个任务 2 线程 | reader（解封装/封装）、sender（令牌桶/sendto） |
+| UdpReceiver | 可选，接收监测线程 |
 
-### 2.3 模块职责
-
-| 模块 | 文件 | 职责 |
-|---|---|---|
-| common | `log.h/cpp` | 线程安全日志，级别/颜色/时间戳 |
-| common | `byte_ring.h/cpp` | 字节环形缓冲，按 188 字节粒度丢包 |
-| net | `platform.h/cpp` | Winsock 初始化、`timeBeginPeriod(1)`、错误文本 |
-| net | `nic.h/cpp` | 网卡枚举（Windows `GetAdaptersAddresses` / Linux `getifaddrs`）、按 IP/名称/序号查找 |
-| net | `multicast_sender.h/cpp` | UDP 发送 socket：网卡绑定、TTL、DSCP、环回、`SIO_UDP_CONNRESET`、统计 |
-| media | `pipeline.h/cpp` | FFmpeg 输入 → mpegts CBR → 自定义 AVIO → 环形缓冲；时间戳归一化；实时节流 |
-| cli | `main.cpp` | `nics` / `probe` / `send` 三个子命令 |
-
-### 2.4 数据流（M1 核心）
+### 2.3 数据流
 
 ```
 文件/URL
    │ av_read_frame
    ▼
-AVPacket ──(copy，不转码)──► mpegts muxer（muxrate=CBR，补空包）
-                                   │ write callback（32KB AVIO）
-                                   ▼
-                            ByteRing（默认 4MB，丢包按 188 对齐）
-                                   │
-                                   ▼
-                        令牌桶（5ms 突发窗口）
-                                   │ 1316B/包（188×7）
-                                   ▼
-                     UDP socket（IP_MULTICAST_IF + bind + TTL + DSCP）
-                                   │
-                                   ▼
-                          239.x.x.x:5000
+AVPacket ──(copy)──► mpegts muxer（muxrate=CBR，补空包）
+                          │ 32KB AVIO
+                          ▼
+                     ByteRing（4MB，188 对齐丢包）
+                          │ 1316B/包
+                          ▼
+                    令牌桶（5ms 突发）
+                          │
+                          ▼
+                  UDP socket（网卡绑定 / TTL / DSCP）
+                          │
+                          ▼
+                   239.x.x.x:5000
 ```
 
-### 2.5 线程模型
-
-| 线程 | 职责 | 关键点 |
-|---|---|---|
-| 主线程 | 参数解析、启动、每秒 `Snapshot()` 打印 | 不碰 FFmpeg |
-| reader 线程 | `av_read_frame` → 时间戳处理 → 实时 sleep → `av_interleaved_write_frame` | 写回调也在该线程执行 |
-| sender 线程 | 从 ring 读 → 令牌桶 → `sendto` | 绝不阻塞 reader |
-| FFmpeg 内部 | 解封装/封装 | 通过 `AVIOContext` 回调与 ring 解耦 |
-
-ring 是「单生产者 / 单消费者 + mutex + condvar」，不是无锁队列；当前规模（≤5 路、≤20 Mbps）完全够用，后续要极致性能再换。
+控制面：Web/API → TaskManager → Pipeline；统计与日志反向经 WS 推送。
 
 ---
 
-## 3. 关键实现（交接重点）
+## 3. 关键实现
 
 ### 3.1 网卡枚举与强制绑定
 
-- Windows 用 `GetAdaptersAddresses(AF_UNSPEC)` 一次拿全：友好名、GUID、IfIndex、OperStatus、链路速率、MAC、IPv4/IPv6、网关
-- 过滤 169.254/16、IPv6 link-local；标记 virtual（TAP/VMware/Hyper-V/VPN/蓝牙）
-- `IP_MULTICAST_IF`（源 IP）+ `bind(源IP:0)` 双保险；Linux 额外 `SO_BINDTODEVICE`
-- `--nic` 支持三种写法：IP、名称/描述子串、1 基序号
-- 选中的网卡没有 IPv4 直接报错，不猜
+- Windows `GetAdaptersAddresses(AF_UNSPEC)`：友好名、GUID、IfIndex、速率、MAC、IPv4/IPv6、网关
+- 过滤 169.254/16、IPv6 link-local；标记 virtual
+- `IP_MULTICAST_IF` + `bind(源IP:0)` 双保险；Linux 额外 `SO_BINDTODEVICE`
+- `--nic` 支持 IP、名称/描述子串、1 基序号；没有 IPv4 直接报错
 
 代码：`src/net/nic.cpp`、`src/net/multicast_sender.cpp`
 
-### 3.2 时间戳归一化（踩坑最多的地方）
+### 3.2 时间戳归一化（M1 踩坑最多）
 
-问题：源文件第一个视频包 `dts > pts`（B 帧），直接减 `dts` 会让 `pts` 变负，muxer 持续报 `dts < pcr, TS is invalid`。
+问题：B 帧源首包 `dts > pts`，直接减 `dts` 会让 PTS 变负，muxer 持续报 `dts < pcr`。
 
 最终方案：
 
-1. 对**可 seek** 的输入，先预读最多 600 个包，取所有流 `min(dts, pts)`（换算到 AV_TIME_BASE）
-2. 回退到文件头，`out_shift = -min_ts`（换算到输出 time_base），保证最早时间戳为 0
-3. 循环播放时用全局 `loop_offset` 递增：`loop_offset = last_norm + 1`，所有流加同一个偏移，**A/V 同步不漂**
-4. 实时节流用 `(norm_dts - loop_offset)`，每轮循环从 0 重新计时，循环点不卡顿
+1. 可 seek 输入先预读最多 600 包，取所有流 `min(dts, pts)` 换算到 AV_TIME_BASE
+2. 回到文件头，`out_shift = -min_ts`，保证最早时间戳为 0
+3. 循环播放 `loop_offset = last_norm + 1`，所有流加同一偏移，A/V 不漂
+4. 实时节流用 `norm_dts - loop_offset`，每轮从 0 重新计时
 
 不可 seek 的直播流跳过预读，退回 `ic->start_time`。
 
-代码：`Pipeline::ReaderLoop()`（`src/media/pipeline.cpp`）
+代码：`Pipeline::ReaderLoop()`
 
 ### 3.3 发送节奏（Windows 定时器坑）
 
-问题：Windows 默认定时器精度 **15.6ms**，`sleep_for(2ms)` 实际睡 15ms；令牌桶按"请求时长"记账，4.5 Mbps 只发出 0.68 Mbps。
+问题：Windows 默认定时器 15.6 ms，`sleep_for(2ms)` 实际睡 15 ms；按“请求时长”记账会严重偏慢。
 
-最终方案：
+方案：
 
-- 用**实测流逝时间**补充令牌：`budget += elapsed * bytes_per_sec`
-- 每次醒来尽量把 `budget` 用满（批量发），不为每个包单独 sleep
-- `timeBeginPeriod(1)` 提高精度（`net::InitSockets`），退出时 `timeEndPeriod(1)`
-- 突发窗口 **5ms**（不是设计初稿的 20ms）：20ms 会让 Windows/Wi‑Fi 回环一次吐 8 个包，实测丢 50%
+- 令牌按**实测流逝时间**补充
+- 每次醒来尽量把 budget 用满（批量发）
+- `timeBeginPeriod(1)`，退出 `timeEndPeriod(1)`
+- 突发窗口 **5 ms**（20 ms 在 Windows/Wi-Fi 回环实测丢 50%）
 
 代码：`Pipeline::SenderLoop()`、`net::InitSockets()`
 
 ### 3.4 环形缓冲与 TS 对齐
 
-问题：ring 溢出时按字节丢，后续 TS 包全部错位（抓包 26% 的 datagram 不以 `0x47` 开头）。
+- `ByteRing(capacity, 188)`：丢包按 188 粒度，保持 TS 边界
+- 发送前检查 `buf[0] == 0x47`，失步时在 `+0/+188/+376` 找同步，找不到整块丢
+- 计数 `buffer_drop_bytes` 和 non-TS chunks
 
-方案：
-
-- `ByteRing(capacity, 188)`：丢包量向下取整到 188 的倍数
-- 发送前检查 `buf[0] == 0x47`；不对就找 `0x47` 在 `+0/+188/+376` 同时成立的偏移；找不到整块丢弃并计数
-
-代码：`src/common/byte_ring.cpp`、`FindTsSyncOffset()`、`Pipeline::SenderLoop()`
+代码：`src/common/byte_ring.cpp`、`FindTsSyncOffset()`
 
 ### 3.5 CBR
 
-- `av_dict_set_int(&opts, "muxrate", muxrate)`，mpegts muxer 用空包补齐
-- `muxrate` 未指定时取 `输入码率 × 1.15`（下限 1 Mbps）
-- 注意：`muxrate` 必须 ≥ 实际码率，否则 muxer 会追不上，ring 持续丢包
-- `pkt_size` 必须是 188 的倍数（已加校验）
+- `muxrate` 交给 mpegts muxer 补空包
+- 未指定时取输入码率 ×1.15（下限 1 Mbps）
+- `muxrate` 必须 ≥ 实际码率，否则 ring 持续丢包
+- `pkt_size` 必须是 188 的倍数
 
 ### 3.6 FFmpeg 日志过滤
 
-`dts < pcr, TS is invalid` 对 B 帧 copy 流是良性的，但 ~40 行/秒会刷爆日志。
-`InstallFfmpegLogFilter()` 用自定义 `av_log_set_callback` **只过滤这一条**，其余 warning/error 照常输出。
-
-代码：`src/media/pipeline.cpp` 顶部
+`dts < pcr, TS is invalid` 对 B 帧 copy 是良性但会刷屏。自定义 `av_log` 回调只过滤这一条，其余 warning/error 走统一日志 sink。
 
 ### 3.7 单播 / 组播统一
 
-`MulticastSender::Open()` 根据目的地址自动判断：
-- 224.0.0.0/4 → 组播路径：`IP_MULTICAST_IF` / TTL / LOOP
-- 其它 → 单播路径：只设 `IP_TTL`，走 OS 路由（`--nic` 仍会 bind 源地址）
+`MulticastSender::Open()` 根据目的地址判断：224/4 走组播路径（`IP_MULTICAST_IF`/TTL/LOOP），否则走单播路径（`IP_TTL`，OS 路由）。所以 `--group` 既可填 `239.x.x.x`，也可填 `192.168.x.x` / `127.0.0.1`。
 
-所以 `--group` 既能填 `239.x.x.x`，也能填 `192.168.x.x` 或 `127.0.0.1`。
+### 3.8 配置、数据目录与媒体库
+
+- 默认数据目录 `%LOCALAPPDATA%\Mcast`，可用 `--data-dir` 覆盖
+- `config.json`：`listen`、`port`、`auth.enabled`、`token`、`media.roots`、`web.enabled`、`vlc_path`、日志参数
+- **认证默认关闭**，局域网测试不需要 token；可在网页“设置”或 `--auth/--no-auth` 开关
+- 启用认证时 token 可自定义（`--token` 或设置页）；为空则自动生成，写入配置并在控制台打印
+- `vlc_path` 可选；“用 VLC 打开”按钮优先用它，否则自动检测常见安装路径
+- 路径统一 UTF-8：Windows 用 `path.u8string()` / `fs::path(std::u8string)`，避免中文路径乱码
+- 根目录和任务输入统一绝对化；`RealPathUtf8` 用 `GetFinalPathNameByHandleW` 解析 junction/symlink
+- 网页端只允许白名单根目录下的媒体文件；网络输入允许 `rtsp/rtmp/http/https/udp/rtp/srt/tcp/mms`，拒绝 `file://` 绕过
+
+代码：`src/common/config.*`、`src/api/http_server.cpp`
+
+### 3.9 任务模型与 TaskManager
+
+任务 JSON 采用设计里的嵌套结构：
+
+```json
+{
+  "id": "e6c73443",
+  "name": "demo loop",
+  "source": { "type": "file", "uri": "D:\\Videos\\demo.ts", "loop": true },
+  "output": { "protocol": "udp-multicast", "group": "239.1.1.1", "port": 5000,
+              "nic": "192.168.1.10", "ttl": 16, "dscp": 0, "loopback": false,
+              "pkt_size": 1316 },
+  "mux": { "format": "mpegts", "muxrate": 8000000, "cbr": true },
+  "encode": { "mode": "copy" },
+  "restart": { "auto": true, "max_retries": 10, "backoff_ms": 1000 },
+  "realtime": true,
+  "speed": 1.0,
+  "buffer_kb": 4096
+}
+```
+
+状态机：
+
+```
+idle → starting → running → stopping → idle
+                     └── error（自动重连：1s/2s/4s…上限 10 次，最长 30s）
+```
+
+- 启动时解析 `nic` 为源 IP，构造 Pipeline
+- Tick 每 1 秒 `Snapshot()`，更新缓存并广播
+- Pipeline 自行停止后：自动重连或进 error；成功运行 60s 后重试计数清零
+- 停止/编辑/删除规则：只有 idle/error 可编辑删除；running/starting 必须先停止
+- `tasks.json` 原子写入；服务重启后任务保留，状态回 idle（不自动拉起）
+- 每个任务独立日志环形缓冲（500 行），sink 通过 Pipeline 线程上下文路由
+
+代码：`src/task/task.*`、`src/task/task_manager.*`
+
+### 3.10 REST / WebSocket / 安全
+
+- 认证默认关闭；开启后 `Authorization: Bearer <token>`，WS 用 `?token=`；`/health` 始终匿名
+- token 比较使用常量时间；设置页可开关认证、填写自定义 token
+- 如果 `--listen 0.0.0.0` 且认证关闭，启动日志会明确警告局域网内任何人可控制
+- 静态页由 mcastd 自己读文件（支持中文路径），不使用 httplib 的 mount
+- `web.enabled` 可动态关闭；非 API 请求直接 404
+- 媒体列表做 realpath 前缀校验，挡住 `..\`、symlink、Windows junction
+- 请求体上限 1 MB；API 错误统一 `{"error": "..."}`
+- WS 事件：`snapshot`、`task`、`deleted`、`log`、`pong`
+- 更新回调在 TaskManager 锁外调用；WS 连接注册表与发送各有锁
+
+代码：`src/api/http_server.*`、`web/*`
+
+### 3.11 接收监测
+
+- `UdpReceiver`：组播 `IP_ADD_MEMBERSHIP` / 单播 bind，500 ms 接收超时
+- 统计：包数、字节、平均码率、运行时长、TS 同步错误、CC 连续性错误
+- 单实例，同一时间只跑一路；`duration_sec=0` 一直运行
+- API：`GET /api/v1/monitor`、`POST /api/v1/monitor/start|stop`
+- 网页端“监测”弹窗 1Hz 轮询显示
+
+代码：`src/net/udp_receiver.*`
+
+### 3.12 日志与优雅停机
+- `LOG_*` 写 stderr；可选 sink 同时写滚动文件、任务日志、WS
+- Pipeline reader/sender 线程设置 `thread_local` 任务上下文，FFmpeg 日志也走同一 sink
+- 文件日志按大小滚动，默认 10 MB × 3
+- 停机顺序：`api.Stop()` → `TaskManager::StopWorker()` → `TaskManager::StopAll()` → 清 sink → 析构 → `ShutdownSockets()`
+- 任务日志用独立 `log_mutex_`，避免 Stop 持有 manager 锁时与 pipeline 线程日志互锁
+
+### 3.13 用 VLC 打开与协议扩展
+
+- `POST /api/v1/tasks/{id}/open-vlc`：任务运行中时，用 `ShellExecuteW` 在**服务器本机**启动 VLC，参数为 `udp://@<group>:<port>`
+- 只允许来自 loopback 或服务器本机 IP 的请求；从 B 电脑调用返回 403
+- 单播任务的目标必须是本机地址，否则 VLC 在服务器上收不到
+- VLC 路径优先取 `vlc_path`，否则自动检测 `Program Files` / `Program Files (x86)`
+- 当前输出只有 UDP；`output.protocol` 目前由地址推导。新增 RTMP/SRT/RTSP/HLS 时需要把 UDP 发送层抽象成 `OutputSink`，详见 `DESIGN.md` 的协议扩展规划
+
+### 3.14 Qt6 桌面客户端
+
+- `src/gui/api_client.*`：`QNetworkAccessManager` 封装 GET/POST/PATCH/DELETE，token 可选，15s 超时
+- `main_window.*`：连接栏、状态卡片、任务表、工具栏；1Hz 定时器轮询 `/api/v1/tasks`，每 5 秒刷新 health
+- `task_dialog.*`：新建/编辑任务，网卡下拉、服务器媒体库、本地文件、探测；字段与 Web 端一致
+- `dialogs.*`：日志、接收监测、服务器媒体库
+- 认证关闭时 Token 留空即可；认证开启时填 token 后连接
+- “VLC”按钮用 `QProcess::startDetached` 在**运行 GUI 的电脑**上打开 VLC，参数 `udp://@<group>:<port>`
+- 服务器地址/token 保存在 `QSettings`（`McastPilot/mcastgui`，INI，明文）
+- Windows 构建后用 `windeployqt` 部署 Qt 运行库，并额外复制 freetype 等非 Qt DLL，双击 `mcastgui.exe` 可运行
+- 未接 WebSocket，因此桌面端是 1Hz 轮询；Web 端仍是实时推送
+
+### 3.15 多目的地与录制（M4 第一批）
+
+- `TaskSpec.extra_outputs`：最多 4 个额外 `group:port`，与主目的地共享网卡/TTL/DSCP/回环
+- `Pipeline` 持有 `vector<unique_ptr<MulticastSender>>`：一次读 ring，同一个 1316B 包发送到所有目的地；令牌桶只按读取字节扣一次
+- 统计聚合：`output_bytes/packets/errors` 为所有目的地之和，`destinations` 字段表示路数；总码率因此是发送总带宽
+- 每个目的地独立 socket/统计，一个失败不影响其它
+- 录制：`TaskSpec.record=true` 时，TaskManager 在 `<data_dir>/recordings/` 生成 `<id>_<毫秒时间戳>.ts`，Pipeline 在 muxer write callback 里同步写文件
+- 录制内容是 CBR MPEG-TS 原始流（含空包），不做切片/转码/清理；`stats.recorded_bytes` 上报
+- Web 表单：额外目的地每行一个 `group:port`；Qt 表单同样有额外目的地和录制开关
+- 增加/删除目的地不需要改发送节奏；只影响 socket 数量与总带宽
 
 ---
 
 ## 4. 代码地图
 
-| 文件 | 行数* | 角色 | 先看哪里 |
-|---|---|---|---|
-| `src/cli/main.cpp` | ~450 | CLI 入口、参数解析、统计打印 | `CmdNics` / `CmdProbe` / `CmdSend` / `main` |
-| `src/media/pipeline.cpp` | ~560 | 核心：FFmpeg 封装 + 时间戳 + 节奏 | `Start` / `ReaderLoop` / `SenderLoop` / `WriteCallback` |
-| `src/net/multicast_sender.cpp` | ~240 | UDP socket 与发送 | `Open` / `Send` |
-| `src/net/nic.cpp` | ~270 | 网卡枚举 | `EnumerateNics` / `FindNic` |
-| `src/common/byte_ring.cpp` | ~100 | 环形缓冲 | `Write` / `Read` |
-| `src/common/log.cpp` | ~120 | 日志 | `LogWrite` |
-| `src/net/platform.cpp` | ~75 | Winsock / 定时器精度 | `InitSockets` |
+| 文件 | 角色 |
+|---|---|
+| `src/cli/main.cpp` | mcastctl：nics / probe / send |
+| `src/server/main.cpp` | mcastd：参数、配置、日志、信号、装配 |
+| `src/media/pipeline.cpp` | 核心：FFmpeg 封装、时间戳、节奏、发送 |
+| `src/media/probe.*` | 输入探测（CLI + API 复用） |
+| `src/net/multicast_sender.cpp` | UDP 发送 socket、网卡绑定、统计 |
+| `src/net/udp_receiver.*` | UDP/TS 接收监测 |
+| `src/net/nic.cpp` | 网卡枚举与查找 |
+| `src/common/byte_ring.cpp` | 环形缓冲 |
+| `src/common/log.*` | 日志、sink、线程上下文 |
+| `src/common/config.*` | config.json、token、路径、安全校验 |
+| `src/common/file_log.*` | 滚动文件日志 |
+| `src/task/task.*` | TaskSpec、JSON、校验 |
+| `src/task/task_manager.*` | 状态机、持久化、采样、重连、日志 |
+| `src/api/http_server.*` | REST、WS、鉴权、静态页、监测 |
+| `src/gui/*` | Qt6 桌面客户端：API、主窗口、任务表单、日志/监测/媒体库 |
+| `web/` | 原生 HTML/CSS/JS 控制台 |
+| `third_party/` | httplib.h、nlohmann/json.hpp |
+| `tests/udp_receiver.py` | 独立接收验证脚本 |
 
 调用链：
 
 ```
-main
- └ CmdSend
-    ├ net::EnumerateNics / FindNic
-    ├ Pipeline::Start
-    │   ├ MulticastSender::Open
-    │   ├ thread SenderLoop
-    │   └ thread ReaderLoop
-    │        ├ avformat_open_input / find_stream_info
-    │        ├ avformat_alloc_output_context2("mpegts")
-    │        ├ avio_alloc_context(WriteCallback)
-    │        ├ avformat_write_header
-    │        └ loop: av_read_frame → shift → pace → av_interleaved_write_frame
-    └ loop: Snapshot() 1Hz
+mcastd main
+ ├ LoadConfig / FileLogger / TaskManager.Load
+ ├ ApiServer.Start → httplib listen
+ ├ 主线程等待 SIGINT/SIGBREAK
+ └ TaskManager worker (1Hz)
+      ├ Pipeline.Snapshot
+      ├ 断流检测 / 自动重连
+      └ update callback → ApiServer.BroadcastTask → WS
 ```
-
-> `build/` 里是测试素材和日志，已 gitignore，不属于源码。
 
 ---
 
 ## 5. 构建与运行
 
-### 5.1 环境（当前已就绪）
+### 5.1 环境
 
 | 项 | 值 |
 |---|---|
-| OS | Windows 11 专业版 |
-| CPU / RAM | Ryzen 7 9700X / 31 GB |
-| 网卡 | WLAN Realtek 8922AE（`192.168.3.15`，2.4Gbps，已连接）；Realtek 2.5GbE（未连接）；TAP-Windows（虚拟） |
-| 工具链 | `F:\091-Opencode\toolchain\msys64`（便携 MSYS2） |
-| 版本 | GCC 16.2.0 / CMake 4.4.4 / Ninja 1.13.2 / FFmpeg 9.0.2 / Qt 6.12.0 / GDB 18.1 |
-
-工具链**不写注册表、不改系统 PATH**；`scripts\build.ps1` 只在当前进程里注入 PATH。
-卸载：`powershell -File scripts\clean-toolchain.ps1`（删目录，之后需重装才能编译）。
+| OS | Windows 11 |
+| 工具链 | `F:\091-Opencode\toolchain\msys64`（便携 MSYS2 UCRT64） |
+| 版本 | GCC 16.2 / CMake 4.4 / Ninja / FFmpeg 9.0 / Qt 6.12 |
 
 ### 5.2 构建
 
@@ -259,151 +336,147 @@ cd F:\091-Opencode\推流工具
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 ```
 
-产物：`build\bin\mcastctl.exe`。
+产物：
 
-> 直接双击 exe 会缺 FFmpeg DLL。请用 `scripts\mcastctl.ps1` 包装运行，或自行把
-> `F:\091-Opencode\toolchain\msys64\ucrt64\bin` 加进 PATH。
+```
+build\bin\mcastctl.exe
+build\bin\mcastd.exe
+build\bin\mcastgui.exe
+build\bin\web\
+```
+
+`mcastgui.exe` 已部署 Qt 运行库，可直接双击；`mcastctl` / `mcastd` 用包装脚本运行。
 
 ### 5.3 运行
 
 ```powershell
-# 网卡列表
+# CLI
 powershell -File scripts\mcastctl.ps1 nics
-
-# 输入探测
 powershell -File scripts\mcastctl.ps1 probe --input D:\Videos\demo.ts
 
-# 推组播
-powershell -File scripts\mcastctl.ps1 send `
-    --input D:\Videos\demo.ts --loop `
-    --group 239.1.1.1 --port 5000 `
-    --nic 192.168.3.15 --ttl 16 --muxrate 8000000
-
-# 推单播
-powershell -File scripts\mcastctl.ps1 send `
-    --input D:\Videos\demo.ts --loop `
-    --group 192.168.3.50 --port 5000 --muxrate 8000000
+# 服务端
+powershell -File scripts\mcastd.ps1 --listen 127.0.0.1 --port 8787 --media-root D:\Videos
 ```
 
-参数表：
+浏览器打开 `http://127.0.0.1:8787/`，默认无需 token；若启用认证则输入 token。
 
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--input` | 必填 | 文件路径或 URL（rtsp/rtmp/udp） |
-| `--group` | 必填 | 目的地址，组播或单播 |
-| `--port` | 必填 | 1-65535 |
-| `--nic` | 空 | IP / 名称 / 序号；空=系统默认路由 |
-| `--ttl` | 16 | 组播 TTL，1-255 |
-| `--dscp` | 0 | QoS，0-63 |
-| `--pkt-size` | 1316 | 必须是 188 的倍数 |
-| `--muxrate` | 0 | bps，0=按输入码率×1.15 自动 |
-| `--buffer` | 4096 | 环形缓冲 KB |
-| `--loop` | 关 | 文件循环 |
-| `--no-realtime` | 关 | 不限速（压测用） |
-| `--speed` | 1.0 | 倍速 |
-| `--duration` | 0 | 秒，0=一直跑 |
-| `--loopback` | 关 | 组播回环（同机接收必须开） |
-| `--sndbuf` | 4MB | socket 发送缓冲 |
-| `--verbose` | 关 | Debug 日志 |
-
-### 5.4 生成测试素材
+桌面客户端：
 
 ```powershell
-$env:PATH="F:\091-Opencode\toolchain\msys64\ucrt64\bin;$env:PATH"
-ffmpeg -y -f lavfi -i "testsrc2=size=1280x720:rate=25" `
-       -f lavfi -i "sine=frequency=800:sample_rate=48000" -t 10 `
-       -c:v libx264 -preset veryfast -b:v 3000k -g 25 -keyint_min 25 -sc_threshold 0 `
-       -c:a aac -b:a 128k -f mpegts build\demo10.ts
-```
-
-> 关键帧间隔要小（`-g 25`），否则从 GOP 中间开始抓包会解码失败，看起来像"流坏了"。
-
-### 5.5 本机验证（已通过）
-
-单播（最干净，不受 Wi‑Fi 组播影响）：
-
-```powershell
-$exe = "F:\091-Opencode\推流工具\build\bin\mcastctl.exe"
-$p = Start-Process $exe -ArgumentList @("send","--input","build\demo10.ts","--loop",
-     "--group","127.0.0.1","--port","5005","--muxrate","4500000","--duration","7") `
-     -RedirectStandardOutput build\v.out -RedirectStandardError build\v.err -WindowStyle Hidden -PassThru
-Start-Sleep -Seconds 1
-python tests\udp_receiver.py --group 127.0.0.1 --port 5005 --seconds 5
-Get-Process mcastctl | Stop-Process -Force
-```
-
-组播（同机回环必须加 `--loopback`）：
-
-```powershell
-$p = Start-Process $exe -ArgumentList @("send","--input","build\demo10.ts","--loop",
-     "--group","239.255.1.1","--port","5010","--nic","192.168.3.15","--ttl","1",
-     "--muxrate","4500000","--loopback","--duration","9") `
-     -RedirectStandardOutput build\m.out -RedirectStandardError build\m.err -WindowStyle Hidden -PassThru
-Start-Sleep -Seconds 1
-python tests\udp_receiver.py --group 239.255.1.1 --port 5010 --iface 192.168.3.15 --seconds 6
-```
-
-`tests/udp_receiver.py` 会输出：实时 Mbps、包数、**TS 同步错误**、**CC 连续性错误**。
-
-### 5.6 跨机验证（待办）
-
-A 电脑推：
-
-```powershell
-powershell -File scripts\mcastctl.ps1 send --input D:\Videos\demo.ts --loop `
-    --group 239.1.1.1 --port 5000 --nic <A 的有线 IP> --ttl 16 --muxrate 8000000
-```
-
-B 电脑收（任选其一）：
-
-```powershell
-python tests\udp_receiver.py --group 239.1.1.1 --port 5000 --iface <B 的 IP> --seconds 60
+build\bin\mcastgui.exe
 # 或
-ffplay "udp://@239.1.1.1:5000?overrun_nonfatal=1&fifo_size=5000000"
+powershell -File scripts\mcastgui.ps1
 ```
 
-> B 电脑跑 Python 脚本需要 Python 3.9+（只用标准库）。
-> 组播不通时按顺序查：`--nic` 是否选对、TTL、Windows 防火墙、交换机 IGMP snooping、B 是否加入同一组。
+默认连接 `http://127.0.0.1:8787`，认证关闭时 Token 留空。
+
+数据目录：
+
+```
+%LOCALAPPDATA%\Mcast\
+  config.json
+  tasks.json
+  logs\mcastd.log
+```
+
+### 5.4 跨机
+
+A 电脑：
+
+```powershell
+powershell -File scripts\mcastd.ps1 --listen 0.0.0.0 --port 8787 --media-root D:\Videos
+```
+
+B 电脑：浏览器打开 `http://<A 的 IP>:8787/`；如果启用了认证，输入 token。
+
+组播接收端：
+
+```powershell
+ffplay "udp://@239.1.1.1:5000?overrun_nonfatal=1&fifo_size=5000000"
+python tests\udp_receiver.py --group 239.1.1.1 --port 5000 --iface <B 的 IP> --seconds 60
+```
+
+组播不通按顺序查：`--nic`、TTL、Windows 防火墙、交换机 IGMP snooping、B 是否加入同一组。
 
 ---
 
-## 6. 实测数据（M1）
+## 6. 实测数据
 
-环境：本机 Windows 11，WLAN 2.4Gbps，同机回环。
-素材：720p25 H.264 + AAC，10s，源码率 3.4 Mbps。
-配置：CBR 4.5 Mbps，`pkt_size=1316`，ring 4 MB。
+### 6.1 M1（本机回环）
 
 | 指标 | 单播 | 组播 |
 |---|---|---|
 | 发送速率 | 4.47–4.51 Mbps | 4.46–4.49 Mbps |
 | 接收速率 | 4.24 Mbps | 4.22 Mbps |
-| 接收包数（5–6s） | 2015 | 2408 |
-| TS 同步错误 | 0 | 0 |
-| CC 连续性错误 | 0 | 0 |
+| TS 同步错误 / CC 错误 | 0 / 0 | 0 / 0 |
 | 缓冲水位 | 1%–15% | 1%–15% |
-| 发送丢包 | 0 KB | 0 KB |
-| 跨循环点 | 无 `dts` 回退 / 无 PCR 异常 | 同左 |
-| FFmpeg 解码 | 通过（首帧从 GOP 中间开始除外） | 同左 |
+| 跨循环点 | 无 dts 回退 / 无 PCR 异常 | 同左 |
 
-> 接收速率略低于发送速率是**统计窗口错位**（接收端晚启动 0.8–1s），不是持续丢包；
-> CC 错误为 0 可以证明 PID 上没有丢包。
+### 6.2 M2（本机）
+
+| 项目 | 结果 |
+|---|---|
+| 单任务 | 4.47 Mbps，0 丢弃，0 错误 |
+| 双任务并发 | 各 4.47 Mbps，0 丢弃，0 错误 |
+| 单播监测 | 4.46 Mbps，0 sync，0 CC |
+| 组播监测 | 4.48 Mbps，0 sync，0 CC |
+| 自动重连 | 文件 EOF 后约 1.5s 恢复 running |
+| 停止再启动 | 发送计数归零，不累计 |
+| 服务重启 | tasks.json 保留任务，状态回 idle |
+| 安全 | 认证开启时无 token 401；越界路径/junction 403；`file://` 400 |
+| 优雅停机 | SIGBREAK 后 exit code 0 |
+
+### 6.3 M3（本机）
+
+| 项目 | 结果 |
+|---|---|
+| GUI 启动 | `mcastgui.exe` 双击启动，窗口正常 |
+| 连接 | 自动连接 `127.0.0.1:8787`，认证关闭无需 token |
+| 任务展示 | 任务/状态/源/目的/码率/缓冲/发送统计正常 |
+| 一键启停 | GUI“停止/启动”驱动服务端任务，1Hz 刷新 |
+| 状态卡片 | 任务总数/运行中/总码率/认证状态正常 |
+| VLC | GUI“VLC”按钮启动本机 VLC 并播放 |
+| 高码率 | 4K HEVC 25 Mbps：24.9 Mbps、buffer 2–4%、0 丢包/错误 |
+| 依赖部署 | windeployqt + freetype 等 DLL 复制，无 PATH 也能启动 |
+
+### 6.4 M4 第一批（本机）
+
+| 项目 | 结果 |
+|---|---|
+| 双目的地 | 同一源推 `127.0.0.1:5300` + `:5301`，两路均收到，TS/CC 错误 0 |
+| 并发统计 | `destinations=2`，总发送约 50 Mbps（每路 25 Mbps） |
+| 低码率回归 | 4.5 Mbps 双目的地正常，ring 不溢出 |
+| 录制 | `recordings/<id>_<时间戳>.ts` 生成 |
+| 录制校验 | ffprobe 识别 HEVC 3440x1440 + AAC |
+| 多目的地失败隔离 | 单个 socket 失败只累计该路错误，其它路继续 |
 
 ---
 
-## 7. 踩坑记录（强烈建议读）
+## 7. 踩坑记录
 
-| # | 现象 | 根因 | 修复 | 位置 |
-|---|---|---|---|---|
-| 1 | 配 4.5 Mbps 只发出 0.68 Mbps | Windows 定时器 15.6ms，按"请求 sleep 时长"记令牌 | 按实测流逝时间补令牌 + `timeBeginPeriod(1)` + 批量发送 | `SenderLoop` / `InitSockets` |
-| 2 | 26% 的 UDP 包不以 `0x47` 开头 | ring 溢出按字节丢，破坏 188 对齐 | 按 188 粒度丢 + 发送前重同步 | `ByteRing` / `FindTsSyncOffset` |
-| 3 | `dts < pcr` 刷屏、PTS 为负 | B 帧首包 `dts > pts`，直接减 dts | 预读取 `min(dts,pts)` 做统一偏移 | `ReaderLoop` |
-| 4 | 循环播放时接收端花屏/卡顿 | 循环后时间戳回退 | `loop_offset` 全局递增，所有流加同一偏移 | `ReaderLoop` |
-| 5 | 同机组播回环丢 50% | 20ms 突发 = 一次 8 个包，Windows/Wi‑Fi 队列吃不消 | 突发窗口降到 5ms | `SenderLoop` |
-| 6 | 日志被 `dts < pcr` 刷爆 | mpegts muxer 对 B 帧 copy 的良性告警 | 自定义 `av_log` 回调只过滤这一条 | `FfmpegLogCallback` |
-| 7 | 刚编译完启动失败/文件被占用 | 杀软扫描新 exe，或旧进程未退出 | 先 `Stop-Process mcastctl`，等 1s 再启动 | 构建/测试脚本 |
-| 8 | 抓包解码报 `non-existing PPS` | 素材 GOP=250 帧（10s 一个关键帧），抓包从 GOP 中间开始 | 测试素材用 `-g 25` | 测试素材命令 |
-| 9 | 中文路径乱码 | Windows 控制台默认编码 | `SetConsoleOutputCP(CP_UTF8)`，全链路 UTF-8 | `main` |
-| 10 | 直接双击 exe 缺 DLL | exe 依赖 `libav*.dll` | 用 `scripts\mcastctl.ps1` 注入 PATH | 包装脚本 |
+| # | 现象 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | 配 4.5 Mbps 只发出 0.68 Mbps | Windows 定时器 15.6ms，按请求 sleep 记账 | 实测流逝时间补令牌 + `timeBeginPeriod(1)` + 批量发 |
+| 2 | 26% UDP 包不以 `0x47` 开头 | ring 溢出按字节丢 | 按 188 粒度丢 + 发送前重同步 |
+| 3 | `dts < pcr` 刷屏、PTS 负 | B 帧首包 dts > pts | 预读 min(dts,pts) 统一偏移 |
+| 4 | 循环播放花屏 | 时间戳回退 | `loop_offset` 全局递增 |
+| 5 | 组播回环丢 50% | 20ms 突发一次 8 包 | 突发窗口降到 5ms |
+| 6 | 日志刷爆 | B 帧 copy 的良性告警 | 自定义 av_log 只过滤这一条 |
+| 7 | 抓包解码 `non-existing PPS` | 素材 GOP=250 | 测试素材用 `-g 25` |
+| 8 | 中文路径乱码 | Windows 控制台/文件路径编码 | `SetConsoleOutputCP`、全链路 UTF-8、`u8string` |
+| 9 | exe 缺 DLL | 依赖 libav*.dll | `scripts\mcastctl.ps1` / `mcastd.ps1` |
+| 10 | 杀软/旧进程占用 exe | 构建/启动失败 | 先停进程再构建 |
+| 11 | 服务重启 `tasks.json` ACCESS_DENIED | 上一个进程/杀软短暂占用，`MoveFileExW` 失败 | 30ms × 10 重试 + remove/rename 回退；无变更不重写 |
+| 12 | 停止任务时卡死 | Stop 持 manager 锁 join 线程，线程日志又拿同一把锁 | 任务日志改用独立 `log_mutex_` |
+| 13 | 网页表格每秒整表重建，按钮点击丢失 | 每次 stats 推送重建 DOM | 按 id 原地更新行，按钮元素复用 |
+| 14 | Windows junction 绕过媒体白名单 | `weakly_canonical` 不解析 junction | `GetFinalPathNameByHandleW` 做 realpath 复检 |
+| 15 | `file://` 可绕过媒体根 | 任意 scheme 都当网络 URL | 只允许 rtsp/rtmp/http/udp/rtp/srt/tcp/mms |
+| 16 | 浏览器连着 WS 时停机等待 | `ws.read` 默认无超时 | `ws.set_read_timeout(1)`，停机 0.56s 退出 |
+| 17 | 监测结束后 VLC 收不到流 | 监测时长到期只停线程，socket 仍占用 UDP 端口 | `Loop` 退出时 `CloseSocket` 释放端口 |
+| 18 | 高码率下 `buffer_fill` 超过 100% | 溢出丢弃量向下取整，腾出的空间不够，`size_` 越过容量 | 丢弃量向上取整并限制在 `size_` 内 |
+| 19 | 25 Mbps 推流 4 秒后掉到 8 Mbps | `sleep_for(2ms)` 被调度成十几 ms，5ms 突发窗口跟不上 | `PreciseSleep` 使用 Windows 高精度可等待定时器，按 token 缺口精确等待 |
+| 20 | `mcastgui.exe` 双击报缺 `libfreetype-6.dll` | windeployqt 未复制 Qt 的非 Qt 运行时依赖 | 构建后额外复制 freetype/stdc++/icu 等 DLL 到 `build\bin` |
+| 21 | `mcastd.exe` 编译后消失 / Permission denied | 360 杀毒误报 `HEUR/QVM202.0.7E5D.Malware.Gen`，隔离并锁文件 | 把项目 `build` 目录加信任区/白名单，从恢复区“恢复并信任” |
 
 ---
 
@@ -411,120 +484,64 @@ ffplay "udp://@239.1.1.1:5000?overrun_nonfatal=1&fifo_size=5000000"
 
 | 优先级 | 项 | 说明 |
 |---|---|---|
-| **P0** | 跨机未实测 | 本机回环 + 解码已过，但"另一台电脑 VLC 稳定播放"还没跑 |
-| P1 | 无断流重连 | 网络源读失败直接退出；`restart` 配置还没实现（M2） |
-| P1 | 无服务端/持久化 | 预设、任务列表、开机自启都还没有（M2） |
-| P1 | 无接收监测 | 目前靠 Python 脚本，正式工具没有（M2） |
-| P1 | 无多目的地 | 一路源只能推一个地址（M4） |
-| P2 | 无转码/采集/屏幕 | 输入必须是 FFmpeg 能直接 copy 的源（M4） |
-| P2 | 仅 IPv4 | 组播/单播都是 AF_INET |
-| P2 | 仅 Windows 实测 | Linux 分支代码在，但没编译验证 |
-| P3 | 无单元测试 / CI | `tests/` 只有手工验证脚本 |
-| P3 | 未 git init | 目录还不是 git 仓库，`.gitignore` 已准备好 |
-| P3 | `muxrate` 自动估算 | 取 `ic->bit_rate × 1.15`；TS 源码率不准时建议显式指定 |
-| P3 | DSCP 可能被驱动忽略 | Windows 上部分网卡不认 `IP_TOS`，需要交换机侧验证 |
+| **P0** | 跨机未实测 | M2 本机浏览器/接口通过，B 电脑访问 + VLC 播放还没跑 |
+| P1 | 无 HTTPS / 用户体系 | 认证默认关闭；开启后单 token + 局域网 HTTP，只用于可信网络 |
+| P1 | VLC 按钮仅本机 | 从 B 电脑网页调用会被拒绝；B 电脑需自己打开 VLC |
+| P1 | 输出仅 UDP | RTMP/SRT/RTSP/HLS 尚未接入，见协议扩展规划 |
+| P1 | 任务不自动恢复 | 服务重启后任务保留但回到 idle |
+| P1 | 无 Windows 服务安装 | 目前前台 `--console` 运行 |
+| P1 | Qt 端轮询 | 桌面端 1Hz REST 轮询，未接 WebSocket |
+| P2 | Qt 端 token 明文 | 保存在本机 QSettings INI，未接 Windows 凭据管理器 |
+| P2 | 无安装包 | GUI 是 build 产物，未做安装器/签名 |
+| P2 | 接收监测单路 | 同一时间只跑一个 UdpReceiver |
+| P2 | 多目的地共享网卡 | 额外目的地沿用主目的地的 NIC/TTL/DSCP/回环 |
+| P2 | 录制无切割/清理 | 原始 CBR TS，文件只增不减 |
+| P2 | 无转码/采集/屏幕 | 输入必须能 copy（M4） |
+| P2 | 仅 IPv4 | 组播/单播均 AF_INET |
+| P2 | 仅 Windows 实测 | Linux 分支在，未编译验证 |
+| P3 | 无单元测试/CI | tests 仍是手工脚本 |
+| P3 | Web UI 表宽固定 | 窄屏需横向滚动 |
+| P3 | DSCP 可能被驱动忽略 | 需交换机侧验证 |
 
 ---
 
-## 9. 下一步：M2 实施方案
+## 9. 下一步
 
-### 9.1 目标
+### 9.1 跨机验收（P0）
 
-把 M1 的 `Pipeline` 搬进常驻服务 `mcastd`，加任务管理、REST/WS、网页端和接收监测。
-**发送层（net/media）不改**，只加外壳。
+A 电脑 `--listen 0.0.0.0`，B 电脑：
 
-### 9.2 新增依赖（都放 `third_party/`，单头文件，无构建链）
+- 浏览器访问 `http://<A>:8787/`，新建/启停任务
+- Qt 客户端填 A 的地址，验证任务表、启停、VLC
+- 用 VLC / `tests/udp_receiver.py` 验证组播接收
 
-| 依赖 | 用途 | 备注 |
-|---|---|---|
-| `cpp-httplib` | HTTP + WebSocket + 静态文件 | 单头文件，MIT；不启用 OpenSSL（局域网 HTTP） |
-| `nlohmann/json` | JSON 序列化 | 单头文件，MIT |
-| 前端 | 原生 HTML/CSS/JS + 一个小的 canvas 折线图 | 不引入 npm/Vue，避免构建链 |
+### 9.2 M4：采集/转码
 
-### 9.3 新增文件
+- 多目的地 + TS 录制已完成
+- 剩余：采集卡、屏幕捕获输入
+- 可选转码（H.264/AAC），解决 RTMP 对 HEVC 的兼容问题
+- 录制切片/清理、多目的地独立网卡
 
-```
-src/server/main.cpp          mcastd 入口：--listen/--port/--data-dir/--console
-src/common/config.h/.cpp     config.json、token、媒体库白名单
-src/task/task.h/.cpp         Task 模型、JSON 读写、参数校验
-src/task/task_manager.h/.cpp 任务表、启停、状态机、持久化、自动重连
-src/api/http_server.h/.cpp   httplib 封装、鉴权、路由、WS 广播
-src/net/udp_receiver.h/.cpp  组播接收 + TS/CC 统计（监测用）
-web/index.html / app.js / style.css
-```
+### 9.3 协议扩展（M5）
 
-数据目录默认 `%LOCALAPPDATA%\Mcast\`：
+RTMP/RTMPS → SRT/RTP → RTSP → HLS/录制。前提是先把 UDP 发送层抽成 `OutputSink`，详见 `DESIGN.md` 第 15 节。
 
-```
-config.json     监听地址、端口、token、media.roots、web.enabled
-tasks.json      任务预设与运行状态
-logs/mcastd.log 滚动日志
-```
+### 9.4 工程化
 
-### 9.4 API（与 DESIGN 第 6 节一致）
-
-- `GET  /api/v1/health`
-- `GET  /api/v1/nics`
-- `GET  /api/v1/media/roots` / `GET /api/v1/media/list?path=`
-- `GET/POST /api/v1/tasks`
-- `GET/PATCH/DELETE /api/v1/tasks/{id}`
-- `POST /api/v1/tasks/{id}/start|stop`
-- `GET  /api/v1/tasks/{id}/stats`
-- `GET  /api/v1/tasks/{id}/logs?tail=200`
-- `POST /api/v1/probe`
-- `GET/PATCH /api/v1/settings`
-- `WS   /api/v1/events`（state / stats 1Hz / log）
-
-鉴权：`Authorization: Bearer <token>`；WS 用 `?token=`。token 首次启动生成并打印。
-
-### 9.5 任务状态机
-
-```
-idle → starting → running → stopping → idle
-                    └── error（自动重连退避：1s/2s/4s… 上限 10 次）
-```
-
-### 9.6 媒体库安全
-
-- `std::filesystem::weakly_canonical` 规范化后做前缀校验
-- 只允许白名单根目录下的 `.ts/.mp4/.mkv/.mov/.m4v/.flv/.mp3/.aac`
-- 只读，不提供删除/改名/上传
-- 路径必须是 UTF-8，返回 JSON 时转义
-
-### 9.7 实现顺序（建议）
-
-1. **config + 日志落盘 + 数据目录**（半天）
-2. **Task / TaskManager**：先把 `Pipeline` 包起来，能 start/stop/取 stats（1 天）
-3. **HTTP + token + nics/tasks/stats API**（1–2 天）
-4. **Web UI**：网卡下拉、媒体库浏览、任务表单、启停、实时表格（2 天）
-5. **WS 推送 + 任务持久化 + 自动重连**（1–2 天）
-6. **接收监测**（`udp_receiver` + 网页入口）（1 天）
-7. **联调 + 跨机验收**（1 天）
-
-### 9.8 M2 验收
-
-- [ ] B 电脑浏览器打开 `http://<A>:8787`，输入 token
-- [ ] 新建任务：选 A 上的文件、选网卡、填组播地址、设码率
-- [ ] 一键启动，1 秒内状态 running，码率/丢包实时刷新
-- [ ] 停止 / 重启任务正常，服务重启后任务列表还在
-- [ ] 同时跑 2 路不互相影响
-- [ ] 路径穿越（`..\..\Windows`）被拒绝
-- [ ] 断流后自动重连并恢复 running
+- Windows 服务安装、HTTPS/反向代理、多路监测、任务自动恢复
+- Qt 客户端接 WebSocket（替代 1Hz 轮询）、token 存 Windows 凭据
+- 单元测试/CI、安装包与签名
 
 ---
 
-## 10. 待决策（需要需求方拍板）
+## 10. 待决策
 
-1. **网页端默认监听**
-   - `127.0.0.1`：安全，但 B 电脑要手动改 `0.0.0.0`
-   - `0.0.0.0`：装好即远程可访问，但必须强制 token + 防火墙提示
-   - 建议：默认 `127.0.0.1`，桌面端提供"允许远程访问"开关
-2. **并发上限**
-   - 先按 5 路做，代码结构留到 20 路（每路 2 线程，20 路 = 40 线程，仍可控）
-3. **Web 前端**
-   - 建议原生 JS（无 npm、无构建步骤），交接成本最低
-4. **GUI 框架**
-   - 建议 Qt Widgets（不是 QML），和工具链里已有的 Qt 6.12 匹配
+1. **网页端认证**：默认关闭；需要时在设置里开启并自定义 token。`--listen 0.0.0.0` 且关闭认证时只在可信局域网使用。
+2. **网页端默认监听**：当前默认 `127.0.0.1`；跨机需显式 `--listen 0.0.0.0`。
+3. **VLC 按钮**：当前只允许服务器本机调用，避免远程浏览器启动服务器程序。
+4. **HTTPS**：局域网是否接受 HTTP；若需要，优先用反向代理。
+4. **任务自动恢复**：服务重启是否自动拉起上次 running 的任务。
+5. **并发上限**：当前按 5 路设计，代码未硬限制。
 
 ---
 
@@ -532,122 +549,46 @@ idle → starting → running → stopping → idle
 
 环境与构建：
 
-- [ ] `F:\091-Opencode\toolchain\msys64` 存在，`ucrt64\bin\g++.exe` 可执行
+- [ ] `F:\091-Opencode\toolchain\msys64\ucrt64\bin\g++.exe` 可执行
 - [ ] `powershell -File scripts\build.ps1` 成功
 - [ ] `powershell -File scripts\mcastctl.ps1 nics` 能列出网卡
-- [ ] 跑一次 5.5 节的单播回环，`sync_err=0 / cc_err=0`
-- [ ] 知道 exe 不能直接双击（缺 DLL），要用包装脚本
-- [ ] `ssh -T git@github.com` 返回 `Hi jiexu-bit!`
-- [ ] `git push` 成功，`origin/main` 与本地 `main` 一致
+- [ ] `powershell -File scripts\mcastd.ps1` 能启动；默认无需 token
+- [ ] 需要时在设置里启用认证并填写自定义 token
+- [ ] 浏览器登录网页端，新建任务并启动
+- [ ] 双击 `build\bin\mcastgui.exe`，连接服务端并看到任务
+- [ ] GUI 停止/启动、VLC 按钮正常
+- [ ] 单播/组播监测，`sync_err=0 / cc_err=0`
+- [ ] `git status` 清楚当前改动是否已提交
 
 项目状态：
 
-- [ ] 目录**还不是 git 仓库**；`.gitignore` 已写好，建议先 `git init` + 首次提交
-- [ ] `build/` 里是测试素材和日志，可随时删
-- [ ] 根目录 `Typora_Hook_Log.txt` **与本项目无关**，未处理
-- [ ] 工具链在项目外，若换机器需重跑 `setup-toolchain.ps1`（约 2GB）
-- [ ] 已知限制清单（第 8 节）已读
-
-下一步：
-
-- [ ] 确认第 10 节两个决策
-- [ ] 按 9.7 的顺序开 M2
-- [ ] M2 第一个可演示目标：浏览器里新建一个任务并启动
+- [x] M1/M2/M3 + M4 第一批代码已提交
+- [ ] 跨机验收完成
+- [ ] `build/` 是测试产物，随时可删
+- [ ] 工具链在项目外，换机器需重跑 `setup-toolchain.ps1`
 
 ---
 
-## 12. 版本管理与 GitHub
-
-### 12.1 仓库
+## 12. 版本管理
 
 | 项 | 值 |
 |---|---|
-| 远程 | `git@github.com:jiexu-bit/McastPilot.git`（SSH） |
-| 网页 | <https://github.com/jiexu-bit/McastPilot> |
+| 远程 | `git@github.com:jiexu-bit/McastPilot.git` |
 | 分支 | `main` |
-| 首个版本 | `v0.1.0-m1` |
-| 提交身份 | `jiexu-bit <yangjiexu@live.com>` |
-| 许可证 | MIT（`LICENSE`，GitHub 建仓时生成） |
+| 已有 tag | `v0.1.0-m1`、`v0.3.0-m3` |
+| 当前版本 | `0.3.0-m3`（M4 第一批已包含） |
+| 许可证 | MIT |
 
-### 12.2 本机 SSH 配置
+约定：
 
-```
-C:\Users\Yangjiexu\.ssh\id_ed25519_mcastpilot      私钥（不要外传）
-C:\Users\Yangjiexu\.ssh\id_ed25519_mcastpilot.pub  公钥（已加到 GitHub）
-C:\Users\Yangjiexu\.ssh\config                     github.com 指定使用该 key
-```
-
-`config` 内容：
-
-```text
-Host github.com
-    HostName github.com
-    User git
-    IdentityFile ~/.ssh/id_ed25519_mcastpilot
-    IdentitiesOnly yes
-    StrictHostKeyChecking accept-new
-```
-
-验证：
-
-```powershell
-ssh -T git@github.com
-# Hi jiexu-bit! You've successfully authenticated, but GitHub does not provide shell access.
-```
-
-> 返回码是 `1`，这是正常的：GitHub 认证成功但不提供 shell。
-
-公钥已添加到 <https://github.com/settings/keys>，标题 `McastPilot dev (Windows)`，
-指纹 `SHA256:wOZLGmRTw6RNDHnVRFLbUK21wRN74PQFOqJfl6MHM1Q`。
-
-### 12.3 换一台机器怎么接
-
-1. 生成**新的** key（不要复制私钥）：
-
-   ```powershell
-   ssh-keygen -t ed25519 -f $env:USERPROFILE\.ssh\id_ed25519_mcastpilot -N '""' -C "jiexu-bit@McastPilot"
-   ```
-
-2. 把 `id_ed25519_mcastpilot.pub` 的内容加到 <https://github.com/settings/ssh/new>
-3. 按 12.2 写 `~/.ssh/config`
-4. `ssh -T git@github.com` 看到 `Hi jiexu-bit!` 即成功
-5. 克隆并构建：
-
-   ```powershell
-   git clone git@github.com:jiexu-bit/McastPilot.git
-   cd McastPilot
-   powershell -File scripts\setup-toolchain.ps1
-   powershell -File scripts\build.ps1
-   ```
-
-### 12.4 日常命令
-
-```powershell
-cd F:\091-Opencode\推流工具
-
-git status
-git diff
-git add -A
-git commit -m "feat: ..."
-git push
-
-# 发版本
-git tag -a v0.2.0-m2 -m "M2: 服务端 + Web"
-git push --tags
-```
-
-### 12.5 约定
-
-- 仓库只放源码/文档/脚本；`build/`、`*.log`、`.vscode/`、`*.user` 已忽略
-- `.gitattributes`：代码统一 LF，`.ps1` 检出为 CRLF；仓库本地 `core.autocrlf=false`，避免行尾抖动
-- **不要把 token/密码写进仓库或聊天**；GitHub 认证只走 SSH
-- 构建产物（`mcastctl.exe`、DLL 副本）不进仓库
-- 需要 Issue / Release / PR 管理时再装 `gh`：`winget install --id GitHub.cli`，然后 `gh auth login`
+- 仓库只放源码/文档/脚本/单头依赖；`build/`、`*.log`、`.vscode/` 忽略
+- `.gitattributes`：代码 LF，`.ps1` 检出 CRLF
+- 不把 token/密码写进仓库
 
 ---
 
 ## 13. 相关文档
 
 - [DESIGN.md](DESIGN.md)：完整设计（目标、协议、任务模型、风险）
-- [README.md](README.md)：快速开始
-- [tests/udp_receiver.py](tests/udp_receiver.py)：验证用接收器（组播/单播、TS/CC 统计）
+- [README.md](README.md)：快速开始、API 摘要、已知限制
+- [tests/udp_receiver.py](tests/udp_receiver.py)：独立接收验证脚本

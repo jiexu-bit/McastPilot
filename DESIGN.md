@@ -69,10 +69,10 @@
 
 | 产物 | 说明 |
 |---|---|
-| `mcastd.exe` | 服务端（M2，待实现），唯一真正持有 socket 和 FFmpeg 上下文的常驻进程 |
+| `mcastd.exe` | 服务端（M2 已实现），唯一真正持有任务、HTTP/WS 和 FFmpeg 上下文的常驻进程 |
 | `mcastctl.exe` | CLI 客户端（M1 已实现），也可独立当单次推流工具用 |
-| `mcastgui.exe` | Qt6 桌面客户端（M3） |
-| `web/` | 静态前端资源，由 `mcastd` 托管，可开关（M2） |
+| `mcastgui.exe` | Qt6 桌面客户端（M3 已实现） |
+| `web/` | 原生前端资源，由 `mcastd` 托管，可开关（M2 已实现） |
 
 ---
 
@@ -161,8 +161,9 @@
 
 - 传输：HTTP/1.1 + JSON；实时事件走 WebSocket
 - 默认端口 `8787`，默认只监听 `127.0.0.1`
-- 认证：`Authorization: Bearer <token>`；WebSocket 用 `?token=`
-- token 首次启动自动生成，写入配置文件，控制台打印
+- 认证默认关闭，可在设置或命令行开启；开启后 `Authorization: Bearer <token>`，WebSocket 用 `?token=`
+- token 可自定义；启用认证且为空时自动生成，写入配置文件，控制台打印
+- `--listen 0.0.0.0` 且认证关闭时启动日志会警告
 
 ### 6.1 REST
 
@@ -177,12 +178,15 @@
 | GET | `/api/v1/tasks/{id}` | 任务详情 |
 | PATCH | `/api/v1/tasks/{id}` | 修改（仅停止态） |
 | DELETE | `/api/v1/tasks/{id}` | 删除 |
-| POST | `/api/v1/tasks/{id}/start` | 启动 |
-| POST | `/api/v1/tasks/{id}/stop` | 停止 |
+| POST | `/api/v1/tasks/{id}/start|stop` | 启动 / 停止 |
+| POST | `/api/v1/tasks/{id}/open-vlc` | 服务器本机打开 VLC（仅 loopback/本机 IP） |
 | GET | `/api/v1/tasks/{id}/stats` | 实时统计 |
 | GET | `/api/v1/tasks/{id}/logs?tail=200` | 最近日志 |
 | POST | `/api/v1/probe` | 探测输入（编码/分辨率/码率） |
 | GET/PATCH | `/api/v1/settings` | 全局设置（含 `web.enabled`） |
+| GET | `/api/v1/monitor` | 当前接收监测状态 |
+| POST | `/api/v1/monitor/start` | 开始接收监测（组播加入 / 单播监听） |
+| POST | `/api/v1/monitor/stop` | 停止接收监测 |
 | WS | `/api/v1/events` | 状态/统计/日志推送 |
 
 ### 6.2 任务模型
@@ -205,8 +209,12 @@
     "ttl": 16,
     "dscp": 34,
     "loopback": false,
-    "pkt_size": 1316
+    "pkt_size": 1316,
+    "extra": [
+      { "group": "239.1.1.2", "port": 5000 }
+    ]
   },
+  "record": true,
   "mux": {
     "format": "mpegts",
     "muxrate": 8000000,
@@ -233,15 +241,34 @@
 - `running` 下源断开 → 自动重连（指数退避），超过重试次数进 `error`
 - 状态变更全部落盘并广播到 WS
 
+### 6.4 接收监测
+
+`mcastd` 内置一个 `UdpReceiver`，用于测试时直接判断“流到底通没通”：
+
+- 组播：绑定端口后 `IP_ADD_MEMBERSHIP`，可指定接收网卡
+- 单播：绑定指定本地 IP 或 `0.0.0.0`
+- 统计：接收包数、字节、平均码率、运行时长、TS 同步错误、CC 连续性错误
+- 同一时间只跑一路；`duration_sec=0` 表示一直运行
+- 网页端“监测”弹窗 1Hz 轮询；也可以直接用 `tests/udp_receiver.py`
+
+### 6.5 任务日志与优雅停机
+
+- `LOG_*` 写入 stderr，同时通过 sink 写滚动文件、任务日志环形缓冲和 WebSocket
+- Pipeline reader/sender 线程设置 thread-local 任务 id，FFmpeg 日志也按任务归类
+- 任务日志使用独立锁，避免“停止任务时持有 manager 锁 join 线程、线程又写日志”的死锁
+- 停机顺序：停 HTTP → 停 TaskManager worker → 停所有 Pipeline → 清 sink → 关 WSA
+
 ---
 
 ## 7. 媒体库与安全
 
 - 配置 `media.roots` 白名单，例如 `["D:\\Videos", "E:\\Stream"]`
-- 浏览接口做 **realpath 规范化 + 前缀校验**，挡住 `..\` 和符号链接穿越
-- 只读：不提供删除/改名/上传（后续按需加）
-- 网页端开关 `web.enabled` 默认 `false`，桌面端一键开启
-- 监听地址默认 `127.0.0.1`；跨机需显式改成 `0.0.0.0`，并强制 token
+- 浏览接口做 **realpath 规范化 + 前缀校验**，挡住 `..\`、符号链接和 Windows junction
+  - Windows 使用 `GetFinalPathNameByHandleW` 解析 reparse point（`weakly_canonical` 对 junction 不可靠）
+- 本地输入只允许白名单内路径；网络输入只允许 `rtsp/rtmp/http/https/udp/rtp/srt/tcp/mms`，拒绝 `file://`
+- 只读：不提供删除/改名/上传
+- 网页端开关 `web.enabled` 可动态切换；监听地址默认 `127.0.0.1`
+- 单 token + 常量时间比较；跨机需显式 `--listen 0.0.0.0`，只在可信局域网使用
 - 所有日志、路径按 UTF-8 处理，避免中文路径乱码
 
 ---
@@ -257,18 +284,20 @@
 ├─ scripts/
 │  ├─ setup-toolchain.ps1   便携 MSYS2 + 依赖安装
 │  ├─ build.ps1             cmake configure + build
-│  ├─ mcastctl.ps1          带 DLL 环境的运行包装器
+│  ├─ mcastctl.ps1          CLI 运行包装器
+│  ├─ mcastd.ps1            服务端运行包装器
 │  └─ clean-toolchain.ps1   一键卸载工具链
 ├─ src/
-│  ├─ common/               日志、环形缓冲
-│  ├─ net/                  网卡枚举、UDP 发送（组播/单播）、平台层
-│  ├─ media/                FFmpeg 输入、TS 封装、节奏
-│  ├─ task/                 任务模型与调度（M2）
-│  ├─ api/                  HTTP/WS 服务（M2）
-│  ├─ server/               mcastd 入口（M2）
+│  ├─ common/               日志、环形缓冲、配置、滚动文件日志
+│  ├─ net/                  网卡枚举、UDP 发送、UDP/TS 接收、平台层
+│  ├─ media/                FFmpeg 输入、TS 封装、节奏、probe
+│  ├─ task/                 任务模型、TaskManager、持久化、自动重连
+│  ├─ api/                  HTTP/WS 服务、鉴权、静态页
+│  ├─ server/               mcastd 入口
 │  ├─ cli/                  mcastctl
-│  └─ gui/                  mcastgui（M3）
-├─ web/                     静态前端（M2）
+│  └─ gui/                  mcastgui（Qt6 Widgets）
+├─ web/                     原生 HTML/CSS/JS 控制台
+├─ third_party/             httplib.h、nlohmann/json.hpp
 └─ tests/                   udp_receiver.py 等验证脚本
 ```
 
@@ -291,10 +320,11 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 
 | 阶段 | 内容 | 状态 | 验收标准 |
 |---|---|---|---|
-| **M1** | 网卡枚举 + 组播/单播发送 + FFmpeg 封装 + CLI | ✅ 本机回环已验证，跨机待测 | `mcastctl send --input demo.ts --group 239.1.1.1 --port 5000 --nic 192.168.1.10` 后，另一台机器 VLC 能稳定播放，码率/丢包可见 |
-| **M2** | 服务端 + REST/WS + 任务持久化 + 网页端 | 待开始 | 浏览器里新建任务、启停、看实时曲线；跨机可访问 |
-| **M3** | Qt6 桌面客户端 | 待开始 | 网卡下拉、预设列表、一键启停、状态卡片 |
-| **M4** | 采集/屏幕/转码/录制/多目的地/接收监测 | 待开始 | 采集卡推流、同时推两个组播、录制存档 |
+| **M1** | 网卡枚举 + 组播/单播发送 + FFmpeg 封装 + CLI | 完成（本机回环；跨机待测） | `mcastctl send ...` 后另一台机器 VLC 稳定播放，码率/丢包可见 |
+| **M2** | 服务端 + REST/WS + 任务持久化 + 网页端 + 接收监测 | 完成（本机联调；跨机待测） | 浏览器新建任务、启停、实时曲线；服务重启任务保留；两路并发；路径穿越拒绝；断流恢复 |
+| **M3** | Qt6 桌面客户端 | 完成（本机验证核心链路） | 网卡下拉、任务列表、一键启停、状态卡片、日志/监测、VLC |
+| **M4** | 采集/屏幕/转码/录制/多目的地 | 进行中：多目的地 + TS 录制已完成 | 采集卡推流、同时推两个组播、录制存档 |
+| **M5** | 更多输出协议：RTMP/SRT/RTSP/HLS | 待开始 | 同一任务可切换协议；RTMP/SRT 推流可被服务端稳定接收 |
 
 ---
 
@@ -342,6 +372,111 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 
 M1 验收状态：
 
-- ✅ 本机单播 / 组播回环：4.2 Mbps、0 TS 同步错误、0 CC 错误、FFmpeg 解码通过
-- ⬜ 跨机（第二台电脑）VLC 播放：**尚未实测**
-- ⬜ 断流重连：M2 实现
+- 本机单播 / 组播回环：4.2 Mbps、0 TS 同步错误、0 CC 错误、FFmpeg 解码通过
+- 跨机（第二台电脑）VLC 播放：**尚未实测**
+- 断流重连：M2 已实现
+
+---
+
+## 14. M2 实现记录（与初版设计的偏差）
+
+| 项 | 初版设计 | 实际实现 | 原因 |
+|---|---|---|---|
+| Web 默认开关 | 默认 `false` | 默认 `true`，可 `--no-web` | 当时 M3 尚未开始，默认开才能直接用浏览器验收 |
+| Web 技术 | 原始 HTML/CSS/JS | 保持原生，无 npm | 交接成本最低 |
+| 接收监测 | 计划内 | 单实例 `UdpReceiver`，REST + 网页弹窗 | 满足“流通没通”的测试需求，多路留后续 |
+| 任务日志 | `/logs` API | 每任务 500 行环形缓冲 + WS 实时推送 | 比轮询更直观 |
+| 静态页 | cpp-httplib mount | 自写静态路由 + `fs::path` | 项目路径含中文，mount 的窄字符串在 Windows 不可靠 |
+| 路径安全 | realpath 前缀 | 额外用 `GetFinalPathNameByHandleW` | `weakly_canonical` 不解析 NTFS junction |
+| 输入 URL | 未限制 | 只允许 rtsp/rtmp/http/udp/rtp/srt/tcp/mms | 阻止 `file://` 绕过媒体白名单 |
+| 任务状态持久化 | 状态落盘 | 只持久化任务配置，重启回 idle | 断流/运行的瞬态状态不适合直接恢复 |
+| 设置更新 | PATCH | 先复制校验、保存成功再替换内存配置 | 避免部分字段生效、部分失败 |
+| 认证 | 单 token 必选 | **默认关闭**，设置/命令行可开启并自定义 | 局域网测试免登录；暴露到局域网时再开启 |
+| VLC 播放 | 未设计 | 任务行“VLC”按钮，服务器本机 `ShellExecuteW` | 方便同机验收；远程浏览器禁止启动服务器程序 |
+| 输出协议 | 预留字段 | `output.protocol` 由地址推导为 UDP 组播/单播 | 协议扩展见第 15 节 |
+
+M2 验收状态：
+
+- 本机单任务 / 双任务并发：4.47 Mbps，0 丢弃/错误
+- 新建、启停、编辑、删除、服务重启任务保留：通过
+- 单播 / 组播接收监测：0 TS 同步错误、0 CC 错误
+- 断流自动重连、路径穿越/junction/`file://` 拒绝：通过
+- 跨机 B 电脑浏览器 + VLC：**尚未实测**
+
+---
+
+## 15. 协议扩展规划
+
+当前 `Pipeline` 只面向 UDP 组播/单播：解封装 → mpegts CBR → ByteRing → 令牌桶 → `sendto`。任务 JSON 里的 `output.protocol` 目前由目的地址推导。
+
+要让同一套任务管理支持 RTMP/SRT/RTSP/HLS，需要把发送层抽象为 `OutputSink`：
+
+```
+Pipeline（解封装/封装）
+   └── OutputSink
+        ├── UdpTsSink      组播/单播、CBR、5ms 节奏、发送统计
+        ├── FfmpegUrlSink  rtmp/rtmps、srt、rtsp、http
+        └── FileSink       mpegts/hls 录制
+```
+
+任务模型：
+
+```json
+{
+  "output": {
+    "protocol": "rtmp",
+    "url": "rtmp://live.example.com/app/key",
+    "ttl": 16,
+    "dscp": 0
+  }
+}
+```
+
+实现顺序：
+
+1. 抽 `OutputSink` 接口，把现有 UDP 逻辑原样搬进 `UdpTsSink`，保证 M1/M2 行为不变
+2. 增加 `FfmpegUrlSink`：用 `avformat_alloc_output_context2` + `avio_open2` 打开 RTMP/SRT/RTSP
+3. Task 表单增加协议下拉、URL/服务器/流密钥字段；UDP 仍显示网卡/组播地址
+4. 统计与重连：UDP 用现有统计；FFmpeg 输出用写失败/EOF 触发 TaskManager 重连
+5. 多目的地：一个封装结果 fan-out 到多个 `OutputSink`（M4）
+
+工具链 FFmpeg 9.0 已确认包含：`rtmp/rtmps`、`srt`、`rtsp`、`udp`、`tcp`、`http` 协议，以及 `flv`、`mpegts`、`rtsp`、`hls` muxer。
+
+---
+
+## 16. Qt6 桌面客户端（M3）
+
+- Qt Widgets + Qt Network，CMake `find_package(Qt6 COMPONENTS Widgets Network)`
+- 独立进程，通过 REST 访问 `mcastd`，不直接持有 Pipeline
+- 主界面：连接栏、任务/运行/总码率/认证状态卡片、任务表、工具栏
+- 任务表单：名称、输入、循环/实时、网卡下拉、组播地址/端口、TTL/DSCP、CBR、包大小、缓冲、倍速、回环、自动重连
+- 服务器媒体库浏览、本地文件选择、输入探测
+- 日志、接收监测弹窗；运行中任务可在 GUI 所在电脑上打开 VLC
+- 1Hz REST 轮询（未接 WebSocket）；服务器地址/token 存 QSettings（明文）
+- Windows 用 windeployqt + 额外运行时 DLL 复制，双击可运行；无安装包/签名
+
+---
+
+## 17. M4 第一批：多目的地与录制
+
+### 17.1 多目的地
+
+- 任务 JSON 的 `output.extra` 最多 4 项，每项 `{group, port}`
+- 与主目的地共享网卡、TTL、DSCP、组播回环、包大小
+- Pipeline 读一次 ring 后向所有 `MulticastSender` 发送同一份 UDP payload；令牌桶只按读取字节扣一次
+- 每个目的地独立 socket 和统计；单路失败只影响该路
+- 统计中 `output_bytes/packets/errors` 为所有目的地之和，`destinations` 为路数，`bitrate_mbps` 是发送总带宽
+
+### 17.2 TS 录制
+
+- 任务字段 `record: true`
+- TaskManager 在 `<data_dir>/recordings/` 生成 `<taskid>_<毫秒时间戳>.ts`
+- Pipeline 在 muxer 的 AVIO write callback 中同步写文件，内容为 CBR MPEG-TS 原始流（含空包）
+- `/tasks/{id}/stats` 增加 `recorded_bytes`
+- 暂不做切片、滚动清理、转码；停止任务即关闭文件
+
+### 17.3 后续
+
+- 采集卡 / 屏幕捕获输入
+- 转码（H.264/AAC）与 RTMP 兼容
+- 多目的地独立网卡、录制切片/清理

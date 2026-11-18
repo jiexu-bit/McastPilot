@@ -1,9 +1,14 @@
 #include "net/platform.h"
 
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #ifdef _WIN32
 #include <timeapi.h>
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 namespace {
 bool g_wsa_ready = false;
 bool g_timer_raised = false;
@@ -44,6 +49,33 @@ void ShutdownSockets() {
         g_wsa_ready = false;
     }
 #endif
+}
+
+void PreciseSleep(int64_t microseconds) {
+    if (microseconds <= 0) return;
+#ifdef _WIN32
+    struct TimerHolder {
+        HANDLE handle = nullptr;
+        TimerHolder() {
+            handle = CreateWaitableTimerExW(nullptr, nullptr,
+                                            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+        }
+        ~TimerHolder() {
+            if (handle) CloseHandle(handle);
+        }
+    };
+    thread_local TimerHolder timer;
+    if (timer.handle) {
+        LARGE_INTEGER due{};
+        due.QuadPart = -microseconds * 10;  // 100 ns units, relative
+        if (SetWaitableTimer(timer.handle, &due, 0, nullptr, nullptr, FALSE)) {
+            WaitForSingleObject(timer.handle, INFINITE);
+            return;
+        }
+    }
+#endif
+    std::this_thread::sleep_for(std::chrono::microseconds(microseconds));
 }
 
 std::string SocketErrorText(int code) {

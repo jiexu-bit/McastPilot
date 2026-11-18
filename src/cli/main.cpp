@@ -11,16 +11,9 @@
 #include <thread>
 #include <vector>
 
-extern "C" {
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/avutil.h>
-#include <libavutil/dict.h>
-#include <libavutil/error.h>
-}
-
 #include "common/log.h"
 #include "media/pipeline.h"
+#include "media/probe.h"
 #include "net/nic.h"
 #include "net/platform.h"
 
@@ -144,7 +137,7 @@ void Usage() {
         "      --group 239.1.1.1 --port 5000 --nic 192.168.1.10 --ttl 16\n"
         "  mcastctl send --input rtsp://10.0.0.5/live --group 239.1.1.2 --port 5000 \\\n"
         "      --nic 192.168.1.10 --muxrate 8000000\n",
-        "0.1.0");
+        "0.3.0-m3");
 }
 
 int CmdNics(int argc, char** argv) {
@@ -221,46 +214,32 @@ int CmdProbe(int argc, char** argv) {
         return 2;
     }
 
-    AVFormatContext* ic = nullptr;
-    AVDictionary* dict = nullptr;
-    av_dict_set(&dict, "rw_timeout", "10000000", 0);
-    int ret = avformat_open_input(&ic, input.c_str(), nullptr, &dict);
-    av_dict_free(&dict);
-    if (ret < 0) {
-        char buffer[AV_ERROR_MAX_STRING_SIZE] = {0};
-        av_strerror(ret, buffer, sizeof(buffer));
-        std::fprintf(stderr, "cannot open '%s': %s\n", input.c_str(), buffer);
-        return 2;
-    }
-    if (avformat_find_stream_info(ic, nullptr) < 0) {
-        std::fprintf(stderr, "cannot read stream info\n");
-        avformat_close_input(&ic);
+    ProbeResult result;
+    std::string err;
+    if (!ProbeInput(input, result, err)) {
+        std::fprintf(stderr, "%s\n", err.c_str());
         return 2;
     }
 
     std::printf("input        : %s\n", input.c_str());
-    std::printf("format       : %s\n", ic->iformat && ic->iformat->name ? ic->iformat->name : "?");
-    std::printf("duration     : %.2f s\n",
-                ic->duration > 0 ? static_cast<double>(ic->duration) / AV_TIME_BASE : 0.0);
+    std::printf("format       : %s\n", result.format.empty() ? "?" : result.format.c_str());
+    std::printf("duration     : %.2f s\n", result.duration_sec);
     std::printf("input bitrate: %.3f Mbps\n",
-                ic->bit_rate > 0 ? static_cast<double>(ic->bit_rate) / 1e6 : 0.0);
-    std::printf("streams      : %u\n", ic->nb_streams);
-    for (unsigned i = 0; i < ic->nb_streams; ++i) {
-        const AVStream* st = ic->streams[i];
-        const char* codec = avcodec_get_name(st->codecpar->codec_id);
-        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            std::printf("  #%u video  %s %dx%d %.3f fps %lld bps\n", i, codec,
-                        st->codecpar->width, st->codecpar->height, av_q2d(st->avg_frame_rate),
-                        static_cast<long long>(st->codecpar->bit_rate));
-        } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            std::printf("  #%u audio  %s %d Hz %d ch %lld bps\n", i, codec,
-                        st->codecpar->sample_rate, st->codecpar->ch_layout.nb_channels,
-                        static_cast<long long>(st->codecpar->bit_rate));
+                result.bitrate > 0 ? static_cast<double>(result.bitrate) / 1e6 : 0.0);
+    std::printf("streams      : %u\n", static_cast<unsigned>(result.streams.size()));
+    for (const ProbeStream& st : result.streams) {
+        if (st.type == "video") {
+            std::printf("  #%d video  %s %dx%d %.3f fps %lld bps\n", st.index,
+                        st.codec.c_str(), st.width, st.height, st.fps,
+                        static_cast<long long>(st.bitrate));
+        } else if (st.type == "audio") {
+            std::printf("  #%d audio  %s %d Hz %d ch %lld bps\n", st.index,
+                        st.codec.c_str(), st.sample_rate, st.channels,
+                        static_cast<long long>(st.bitrate));
         } else {
-            std::printf("  #%u other  %s\n", i, codec);
+            std::printf("  #%d other  %s\n", st.index, st.codec.c_str());
         }
     }
-    avformat_close_input(&ic);
     return 0;
 }
 
@@ -440,7 +419,7 @@ int main(int argc, char** argv) {
             Usage();
             result = 0;
         } else if (command == "--version" || command == "-V") {
-            std::printf("mcastctl 0.1.0\n");
+            std::printf("mcastctl 0.3.0-m3\n");
             result = 0;
         } else {
             std::fprintf(stderr, "unknown command: %s\n\n", command.c_str());

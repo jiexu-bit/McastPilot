@@ -2,10 +2,12 @@
 
 #include <atomic>
 #include <cstdint>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "common/byte_ring.h"
 #include "net/multicast_sender.h"
@@ -24,7 +26,10 @@ struct PipelineConfig {
     int pkt_size = 1316;        // UDP payload size (188 * 7)
     int64_t duration_ms = 0;    // 0 = until stopped
     size_t buffer_bytes = 4 * 1024 * 1024;
+    std::string log_tag;        // task id; attached to per-task log lines
     net::McastConfig mcast;
+    std::vector<net::McastConfig> extra_mcasts;
+    std::string record_path;    // empty = no recording
 };
 
 struct PipelineStats {
@@ -36,6 +41,8 @@ struct PipelineStats {
     uint64_t buffer_drop_bytes = 0;
     uint64_t send_errors = 0;
     uint64_t frames = 0;
+    uint64_t recorded_bytes = 0;
+    size_t destinations = 0;
     size_t buffer_bytes = 0;
     size_t buffer_capacity = 0;
     int64_t muxrate_bps = 0;
@@ -70,7 +77,8 @@ private:
 
     PipelineConfig config_;
     std::unique_ptr<ByteRing> ring_;
-    net::MulticastSender sender_;
+    std::vector<std::unique_ptr<net::MulticastSender>> senders_;
+    std::ofstream record_file_;
 
     std::thread reader_thread_;
     std::thread sender_thread_;
@@ -78,6 +86,7 @@ private:
 
     std::atomic<uint64_t> frames_{0};
     std::atomic<uint64_t> muxed_bytes_{0};
+    std::atomic<uint64_t> recorded_bytes_{0};
 
     std::atomic<int64_t> rate_bps_{0};
     int64_t started_us_ = 0;

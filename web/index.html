@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>McastPilot 控制台</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">M</div>
+      <div>
+        <h1>McastPilot</h1>
+        <p>组播推流控制台</p>
+      </div>
+    </div>
+    <div class="status">
+      <span id="connDot" class="dot"></span>
+      <span id="connText">正在连接</span>
+      <span id="healthText" class="muted"></span>
+    </div>
+    <div class="top-actions">
+      <button id="btnMonitor" class="ghost" type="button">监测</button>
+      <button id="btnSettings" class="ghost" type="button">设置</button>
+      <button id="btnToken" class="ghost" type="button">Token</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="toolbar">
+      <div>
+        <h2>推流任务</h2>
+        <p id="taskSummary" class="muted">加载中...</p>
+      </div>
+      <div class="toolbar-actions">
+        <button id="btnRefresh" class="ghost" type="button">刷新</button>
+        <button id="btnNew" class="primary" type="button">新建任务</button>
+      </div>
+    </section>
+
+    <section class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>任务</th>
+            <th>状态</th>
+            <th>源</th>
+            <th>目的</th>
+            <th>码率</th>
+            <th>缓冲</th>
+            <th>发送 / 丢弃</th>
+            <th class="right">操作</th>
+          </tr>
+        </thead>
+        <tbody id="taskRows"></tbody>
+      </table>
+      <div id="emptyState" class="empty">
+        <strong>还没有任务</strong>
+        <span>点击右上角“新建任务”，选择一个文件并指定组播地址。</span>
+      </div>
+    </section>
+  </main>
+
+  <div id="taskModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="panel wide">
+      <div class="panel-head">
+        <div>
+          <h3 id="taskModalTitle">新建任务</h3>
+          <p class="muted">源文件按 copy 模式封装为 MPEG-TS，不转码。</p>
+        </div>
+        <button class="icon-btn" data-close="taskModal" type="button" aria-label="关闭">×</button>
+      </div>
+      <form id="taskForm">
+        <div class="form-grid">
+          <label class="field full">
+            <span>任务名称</span>
+            <input id="fName" type="text" placeholder="例如：CCTV-1 测试流" autocomplete="off">
+          </label>
+          <label class="field full">
+            <span>输入（本地文件路径或网络 URL）</span>
+            <div class="input-row">
+              <input id="fInput" type="text" placeholder="D:\Videos\demo.ts 或 rtsp://10.0.0.5/live" autocomplete="off" required>
+              <button id="btnBrowse" class="ghost" type="button">浏览</button>
+              <button id="btnProbe" class="ghost" type="button">探测</button>
+            </div>
+          </label>
+          <div class="field full">
+            <div id="probeResult" class="probe-result muted">尚未探测</div>
+          </div>
+          <label class="check">
+            <input id="fLoop" type="checkbox" checked>
+            <span>文件循环播放</span>
+          </label>
+          <label class="check">
+            <input id="fRealtime" type="checkbox" checked>
+            <span>按实时速率读取</span>
+          </label>
+
+          <label class="field">
+            <span>组播 / 目的地址</span>
+            <input id="fGroup" type="text" value="239.1.1.1" required autocomplete="off">
+          </label>
+          <label class="field">
+            <span>端口</span>
+            <input id="fPort" type="number" value="5000" min="1" max="65535" required>
+          </label>
+          <label class="field">
+            <span>发送网卡</span>
+            <select id="fNic">
+              <option value="">系统默认路由</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>TTL</span>
+            <input id="fTtl" type="number" value="16" min="1" max="255">
+          </label>
+          <label class="field">
+            <span>DSCP</span>
+            <input id="fDscp" type="number" value="0" min="0" max="63">
+          </label>
+          <label class="field">
+            <span>CBR 码率 bps（0 = 自动）</span>
+            <input id="fMuxrate" type="number" value="0" min="0" step="100000">
+          </label>
+          <label class="field">
+            <span>UDP 包大小（188 的倍数）</span>
+            <input id="fPktSize" type="number" value="1316" min="188" max="65507" step="188">
+          </label>
+          <label class="field">
+            <span>环形缓冲 KB</span>
+            <input id="fBuffer" type="number" value="4096" min="64" max="262144">
+          </label>
+          <label class="field">
+            <span>倍速</span>
+            <input id="fSpeed" type="number" value="1" min="0.1" max="100" step="0.1">
+          </label>
+          <label class="check">
+            <input id="fLoopback" type="checkbox">
+            <span>组播回环（同机接收时需要）</span>
+          </label>
+          <label class="field full">
+            <span>额外目的地（每行 group:port，最多 4 个）</span>
+            <textarea id="fExtras" rows="2" placeholder="239.1.1.2:5000"></textarea>
+          </label>
+          <label class="check">
+            <input id="fRecord" type="checkbox">
+            <span>录制 TS 到服务端数据目录</span>
+          </label>
+
+          <div class="section-title full">断流重连</div>
+          <label class="check">
+            <input id="fAutoRestart" type="checkbox" checked>
+            <span>源断开后自动重连</span>
+          </label>
+          <label class="field">
+            <span>最大重试次数</span>
+            <input id="fMaxRetries" type="number" value="10" min="0" max="1000">
+          </label>
+          <label class="field">
+            <span>初始退避 ms</span>
+            <input id="fBackoff" type="number" value="1000" min="100" max="60000" step="100">
+          </label>
+        </div>
+        <div id="taskFormError" class="form-error hidden"></div>
+        <div class="panel-actions">
+          <button class="ghost" data-close="taskModal" type="button">取消</button>
+          <button id="btnSaveTask" class="primary" type="submit">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="mediaModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="panel wide">
+      <div class="panel-head">
+        <div>
+          <h3>媒体库</h3>
+          <p class="muted">只读浏览服务端白名单目录。</p>
+        </div>
+        <button class="icon-btn" data-close="mediaModal" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="media-bar">
+        <button id="btnMediaUp" class="ghost" type="button">上一级</button>
+        <span id="mediaPath" class="media-path muted"></span>
+      </div>
+      <div id="mediaList" class="media-list"></div>
+    </div>
+  </div>
+
+  <div id="logsModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="panel wide">
+      <div class="panel-head">
+        <div>
+          <h3 id="logsTitle">任务日志</h3>
+          <p class="muted">最近 500 行，随推送实时追加。</p>
+        </div>
+        <button class="icon-btn" data-close="logsModal" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="panel-actions compact">
+        <button id="btnLogsRefresh" class="ghost" type="button">刷新</button>
+        <button id="btnLogsScroll" class="ghost" type="button">滚到底部</button>
+      </div>
+      <pre id="logsBody" class="logs"></pre>
+    </div>
+  </div>
+
+  <div id="monitorModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h3>接收监测</h3>
+          <p class="muted">加入组播或监听单播端口，统计码率、TS 同步和 CC 连续性错误。</p>
+        </div>
+        <button class="icon-btn" data-close="monitorModal" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="form-grid">
+        <label class="field">
+          <span>组播 / 目的地址</span>
+          <input id="mGroup" type="text" value="239.255.1.1" autocomplete="off">
+        </label>
+        <label class="field">
+          <span>端口</span>
+          <input id="mPort" type="number" value="5000" min="1" max="65535">
+        </label>
+        <label class="field">
+          <span>接收网卡</span>
+          <select id="mIface">
+            <option value="">自动 / 任意</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>监测时长秒（0 = 一直运行）</span>
+          <input id="mDuration" type="number" value="0" min="0" max="3600">
+        </label>
+      </div>
+      <div class="monitor-stats">
+        <div class="monitor-stat"><span>实时码率</span><strong id="mBitrate">—</strong></div>
+        <div class="monitor-stat"><span>接收包数</span><strong id="mPackets">0</strong></div>
+        <div class="monitor-stat"><span>接收字节</span><strong id="mBytes">0 B</strong></div>
+        <div class="monitor-stat"><span>运行时长</span><strong id="mElapsed">0s</strong></div>
+        <div class="monitor-stat"><span>TS 同步错误</span><strong id="mSync">0</strong></div>
+        <div class="monitor-stat"><span>CC 连续性错误</span><strong id="mCc">0</strong></div>
+      </div>
+      <div id="monitorStatus" class="monitor-status muted">未运行</div>
+      <div class="panel-actions">
+        <button id="btnMonitorStop" class="danger" type="button" disabled>停止监测</button>
+        <button id="btnMonitorStart" class="primary" type="button">开始监测</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="settingsModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="panel">
+      <div class="panel-head">
+        <div>
+          <h3>设置</h3>
+          <p class="muted">修改后立即写入 config.json。</p>
+        </div>
+        <button class="icon-btn" data-close="settingsModal" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="form-grid single">
+        <div class="field">
+          <span>监听地址 / 端口</span>
+          <div id="settingsListen" class="readonly">-</div>
+        </div>
+        <label class="field">
+          <span>媒体库根目录（每行一个）</span>
+          <textarea id="sRoots" rows="4" placeholder="D:\Videos"></textarea>
+        </label>
+        <label class="check">
+          <input id="sWebEnabled" type="checkbox">
+          <span>启用网页端</span>
+        </label>
+        <label class="check">
+          <input id="sAuthEnabled" type="checkbox">
+          <span>启用访问 token（默认关闭，局域网测试可不启用）</span>
+        </label>
+        <label class="field">
+          <span>访问 Token</span>
+          <input id="sToken" type="text" autocomplete="off"
+                 placeholder="留空保留当前 token；启用认证且为空时自动生成">
+        </label>
+        <label class="field">
+          <span>VLC 路径（“用 VLC 打开”按钮使用，留空自动检测）</span>
+          <input id="sVlcPath" type="text" autocomplete="off"
+                 placeholder="C:\Program Files\VideoLAN\VLC\vlc.exe">
+        </label>
+        <label class="field">
+          <span>日志级别</span>
+          <select id="sLogLevel">
+            <option value="trace">trace</option>
+            <option value="debug">debug</option>
+            <option value="info">info</option>
+            <option value="warn">warn</option>
+            <option value="error">error</option>
+            <option value="off">off</option>
+          </select>
+        </label>
+        <p class="muted small">监听地址和端口修改需要重启 mcastd 后生效。</p>
+      </div>
+      <div id="settingsError" class="form-error hidden"></div>
+      <div class="panel-actions">
+        <button class="ghost" data-close="settingsModal" type="button">取消</button>
+        <button id="btnSaveSettings" class="primary" type="button">保存设置</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="tokenModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="panel narrow">
+      <div class="panel-head">
+        <div>
+          <h3>输入访问 Token</h3>
+          <p class="muted">Token 在 mcastd 启动时打印在控制台。</p>
+        </div>
+        <button id="btnCloseToken" class="icon-btn hidden" data-close="tokenModal" type="button" aria-label="关闭">×</button>
+      </div>
+      <form id="tokenForm">
+        <label class="field">
+          <span>Token</span>
+          <input id="tokenInput" type="password" autocomplete="current-password" spellcheck="false">
+        </label>
+        <div id="tokenError" class="form-error hidden"></div>
+        <div class="panel-actions">
+          <button class="primary" type="submit">保存并连接</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>

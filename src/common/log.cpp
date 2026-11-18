@@ -22,7 +22,10 @@ namespace mcast {
 namespace {
 
 std::atomic<int> g_level{static_cast<int>(LogLevel::Info)};
-std::mutex g_log_mutex;
+std::mutex g_console_mutex;
+std::mutex g_sink_mutex;
+LogSink g_sink;
+thread_local std::string g_thread_context;
 
 const char* LevelName(LogLevel level) {
     switch (level) {
@@ -59,6 +62,71 @@ void LocalTime(std::tm& out, std::time_t t) {
 #endif
 }
 
+std::string TimeStamp() {
+    const auto now = std::chrono::system_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now.time_since_epoch()) %
+                    1000;
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    LocalTime(tm, t);
+
+    char stamp[32];
+    std::snprintf(stamp, sizeof(stamp), "%02d:%02d:%02d.%03d", tm.tm_hour, tm.tm_min,
+                  tm.tm_sec, static_cast<int>(ms.count()));
+    return stamp;
+}
+
+void Emit(LogLevel level, const std::string& line) {
+    LogSink sink;
+    {
+        std::lock_guard<std::mutex> lock(g_sink_mutex);
+        sink = g_sink;
+    }
+    if (sink) sink(level, g_thread_context, line);
+}
+
+void WriteConsole(LogLevel level, const std::string& stamp, const char* file, int line,
+                  const std::string& body) {
+    const char* base = file ? file : "";
+    const char* slash = std::strrchr(base, '/');
+    const char* bslash = std::strrchr(base, '\\');
+    if (slash && bslash) base = (slash > bslash ? slash : bslash) + 1;
+    else if (slash) base = slash + 1;
+    else if (bslash) base = bslash + 1;
+
+    std::lock_guard<std::mutex> lock(g_console_mutex);
+    if (ColorEnabled()) {
+        std::fprintf(stderr, "%s %s%s\x1b[0m [%s:%d] %s\n", stamp.c_str(),
+                     LevelColor(level), LevelName(level), base, line, body.c_str());
+    } else {
+        std::fprintf(stderr, "%s %s [%s:%d] %s\n", stamp.c_str(), LevelName(level), base,
+                     line, body.c_str());
+    }
+    std::fflush(stderr);
+}
+
+std::string PlainLine(const std::string& stamp, LogLevel level, const char* file, int line,
+                      const std::string& body) {
+    const char* base = file ? file : "";
+    const char* slash = std::strrchr(base, '/');
+    const char* bslash = std::strrchr(base, '\\');
+    if (slash && bslash) base = (slash > bslash ? slash : bslash) + 1;
+    else if (slash) base = slash + 1;
+    else if (bslash) base = bslash + 1;
+
+    std::string out = stamp;
+    out += ' ';
+    out += LevelName(level);
+    out += " [";
+    out += base;
+    out += ':';
+    out += std::to_string(line);
+    out += "] ";
+    out += body;
+    return out;
+}
+
 }  // namespace
 
 void SetLogLevel(LogLevel level) { g_level.store(static_cast<int>(level)); }
@@ -76,17 +144,18 @@ bool ParseLogLevel(const char* text, LogLevel& out) {
     return false;
 }
 
+void SetLogSink(LogSink sink) {
+    std::lock_guard<std::mutex> lock(g_sink_mutex);
+    g_sink = std::move(sink);
+}
+
+void SetThreadLogContext(const std::string& context) { g_thread_context = context; }
+
+std::string ThreadLogContext() { return g_thread_context; }
+
 void LogWrite(LogLevel level, const char* file, int line, const char* fmt, ...) {
     if (static_cast<int>(level) < g_level.load(std::memory_order_relaxed)) return;
     if (level == LogLevel::Off) return;
-
-    const auto now = std::chrono::system_clock::now();
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        now.time_since_epoch()) %
-                    1000;
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-    LocalTime(tm, t);
 
     char body[2048];
     va_list args;
@@ -94,25 +163,22 @@ void LogWrite(LogLevel level, const char* file, int line, const char* fmt, ...) 
     std::vsnprintf(body, sizeof(body), fmt, args);
     va_end(args);
 
-    char stamp[32];
-    std::snprintf(stamp, sizeof(stamp), "%02d:%02d:%02d.%03d", tm.tm_hour, tm.tm_min,
-                  tm.tm_sec, static_cast<int>(ms.count()));
+    const std::string stamp = TimeStamp();
+    WriteConsole(level, stamp, file, line, body);
+    Emit(level, PlainLine(stamp, level, file, line, body));
+}
 
-    const char* base = file ? file : "";
-    const char* slash = std::strrchr(base, '/');
-    const char* bslash = std::strrchr(base, '\\');
-    if (slash && bslash) base = (slash > bslash ? slash : bslash) + 1;
-    else if (slash) base = slash + 1;
-    else if (bslash) base = bslash + 1;
+void LogExternal(LogLevel level, const std::string& message) {
+    if (static_cast<int>(level) < g_level.load(std::memory_order_relaxed)) return;
 
-    std::lock_guard<std::mutex> lock(g_log_mutex);
-    if (ColorEnabled()) {
-        std::fprintf(stderr, "%s %s%s\x1b[0m [%s:%d] %s\n", stamp, LevelColor(level),
-                     LevelName(level), base, line, body);
-    } else {
-        std::fprintf(stderr, "%s %s [%s:%d] %s\n", stamp, LevelName(level), base, line, body);
-    }
-    std::fflush(stderr);
+    std::string body = message;
+    while (!body.empty() && (body.back() == '\n' || body.back() == '\r')) body.pop_back();
+    if (body.empty()) return;
+    if (body.size() > 4096) body.resize(4096);
+
+    const std::string stamp = TimeStamp();
+    WriteConsole(level, stamp, "ffmpeg", 0, body);
+    Emit(level, PlainLine(stamp, level, "ffmpeg", 0, body));
 }
 
 }  // namespace mcast

@@ -29,6 +29,11 @@ $env:PATH = "$bin;" + $env:PATH
 $env:MSYSTEM = "UCRT64"
 $env:PKG_CONFIG_PATH = (Join-Path $ucrt "lib\pkgconfig")
 $env:PKG_CONFIG_LIBDIR = (Join-Path $ucrt "lib\pkgconfig")
+if (-not $env:CMAKE_PREFIX_PATH) {
+    $env:CMAKE_PREFIX_PATH = $ucrt
+} elseif ($env:CMAKE_PREFIX_PATH -notlike "*$ucrt*") {
+    $env:CMAKE_PREFIX_PATH = "$ucrt;$env:CMAKE_PREFIX_PATH"
+}
 
 $cfg = if ($DebugBuild) { "Debug" } else { "Release" }
 
