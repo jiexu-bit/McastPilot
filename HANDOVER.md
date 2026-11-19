@@ -263,6 +263,8 @@ idle → starting → running → stopping → idle
 - `task_dialog.*`：新建/编辑任务，网卡下拉、服务器媒体库、本地文件、探测；字段与 Web 端一致
 - `dialogs.*`：日志、接收监测、服务器媒体库
 - 认证关闭时 Token 留空即可；认证开启时填 token 后连接
+- 如果本机 `mcastd` 没运行，GUI 会自动调用 `scripts\mcastd.ps1` 启动它，并监听 `0.0.0.0`，便于 B 电脑访问
+- 自动启动只在服务器地址是 localhost/127.0.0.1 时触发；远程 GUI 不会启动本机服务
 - “VLC”按钮用 `QProcess::startDetached` 在**运行 GUI 的电脑**上打开 VLC，参数 `udp://@<group>:<port>`
 - 服务器地址/token 保存在 `QSettings`（`McastPilot/mcastgui`，INI，明文）
 - Windows 构建后用 `windeployqt` 部署 Qt 运行库，并额外复制 freetype 等非 Qt DLL，双击 `mcastgui.exe` 可运行

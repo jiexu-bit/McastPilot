@@ -1,6 +1,8 @@
 #include "gui/main_window.h"
 
 #include <QColor>
+#include <QCoreApplication>
+#include <QDir>
 #include <QFileInfo>
 #include <QFrame>
 #include <QHBoxLayout>
@@ -15,6 +17,7 @@
 #include <QStringList>
 #include <QTableWidget>
 #include <QTimer>
+#include <QUrl>
 #include <QVBoxLayout>
 
 #include "gui/api_client.h"
@@ -50,6 +53,21 @@ QFrame* MakeCard(const QString& title, QLabel** value, QWidget* parent) {
     layout->addWidget(caption);
     layout->addWidget(*value);
     return card;
+}
+
+QString WithScheme(QString url) {
+    url = url.trimmed();
+    if (url.isEmpty()) url = "http://127.0.0.1:8787";
+    if (!url.startsWith("http://", Qt::CaseInsensitive) &&
+        !url.startsWith("https://", Qt::CaseInsensitive)) {
+        url.prepend("http://");
+    }
+    return url;
+}
+
+bool IsLocalServerUrl(const QString& url) {
+    const QString host = QUrl(WithScheme(url)).host().toLower();
+    return host == "127.0.0.1" || host == "localhost" || host == "::1";
 }
 
 QString FindVlcExecutable() {
@@ -168,7 +186,7 @@ void MainWindow::buildUi() {
 
     auth_card_->setText("未连接");
 
-    connect(connect_button_, &QPushButton::clicked, this, &MainWindow::connectServer);
+    connect(connect_button_, &QPushButton::clicked, this, &MainWindow::manualConnect);
     connect(new_button_, &QPushButton::clicked, this, &MainWindow::newTask);
     connect(edit_button_, &QPushButton::clicked, this, &MainWindow::editTask);
     connect(start_button_, &QPushButton::clicked, this, &MainWindow::startTask);
@@ -199,6 +217,11 @@ void MainWindow::showError(const QString& title, const QString& error) {
     QMessageBox::warning(this, title, error);
 }
 
+void MainWindow::manualConnect() {
+    local_start_attempted_ = false;
+    connectServer();
+}
+
 void MainWindow::connectServer() {
     api_->setBaseUrl(server_url_->text());
     api_->setToken(token_->text().trimmed());
@@ -211,12 +234,23 @@ void MainWindow::connectServer() {
                                        const QString& error) {
         connect_button_->setEnabled(true);
         if (!ok) {
+            if (!local_start_attempted_ && IsLocalServerUrl(server_url_->text())) {
+                local_start_attempted_ = true;
+                if (startLocalDaemon()) {
+                    setStatus("未检测到本机服务，正在启动 mcastd...");
+                    QTimer::singleShot(1800, this, &MainWindow::connectServer);
+                    return;
+                }
+            }
             setStatus("连接失败：" + error, true);
             return;
         }
+        const bool auto_started = local_start_attempted_;
+        local_start_attempted_ = false;
         connected_ = true;
         auth_card_->setText(data.value("auth").toBool() ? "认证 开启" : "认证 关闭");
-        setStatus("已连接 · v" + data.value("version").toString());
+        setStatus("已连接 · v" + data.value("version").toString() +
+                  (auto_started ? " · 本机服务已自动启动（0.0.0.0）" : ""));
         connect_button_->setText("重新连接");
         QSettings settings(QSettings::IniFormat, QSettings::UserScope, "McastPilot",
                            "mcastgui");
@@ -226,6 +260,33 @@ void MainWindow::connectServer() {
         refreshTasks();
         if (!poll_timer_->isActive()) poll_timer_->start();
     });
+}
+
+bool MainWindow::startLocalDaemon() {
+    const QUrl url(WithScheme(server_url_->text()));
+    const int port = url.port(8787);
+    const QDir app_dir(QCoreApplication::applicationDirPath());
+    const QDir root_dir(app_dir.absoluteFilePath("../.."));
+    const QString script = root_dir.absoluteFilePath("scripts/mcastd.ps1");
+
+    QStringList daemon_args{
+        "--listen", "0.0.0.0",
+        "--port", QString::number(port),
+    };
+    if (QFileInfo::exists(script)) {
+        QStringList args{
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+            "-File", QDir::toNativeSeparators(script),
+        };
+        args << daemon_args;
+        return QProcess::startDetached("powershell.exe", args, root_dir.absolutePath());
+    }
+
+    const QString executable = app_dir.absoluteFilePath("mcastd.exe");
+    if (QFileInfo::exists(executable)) {
+        return QProcess::startDetached(executable, daemon_args, app_dir.absolutePath());
+    }
+    return false;
 }
 
 void MainWindow::refreshHealth() {

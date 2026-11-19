@@ -22,6 +22,8 @@ public:
 private:
     void buildUi();
     void connectServer();
+    void manualConnect();
+    bool startLocalDaemon();
     void refreshHealth();
     void refreshTasks();
     void refreshNics();
@@ -71,4 +73,5 @@ private:
     int poll_tick_ = 0;
     bool connected_ = false;
     bool auth_hint_shown_ = false;
+    bool local_start_attempted_ = false;
 };

@@ -153,6 +153,8 @@ powershell -File scripts\mcastgui.ps1
 ```
 
 - Defaults to `http://127.0.0.1:8787`
+- If the local `mcastd` is not running, the GUI starts it automatically and listens on `0.0.0.0`;
+  another computer can then open `http://<A-LAN-IP>:8787/`
 - Leave Token empty when auth is off; enter it when auth is on
 - Create/edit/start/stop/delete tasks, adapter dropdown, server media browser, logs, receive monitor
 - "VLC" button launches VLC on the machine running the GUI
@@ -250,6 +252,7 @@ gain a protocol dropdown and protocol-specific fields.
 - "Open in VLC" works only when the web UI is opened on the server machine; a remote browser
   cannot launch a local VLC instance on another computer.
 - Authentication is off by default. If you expose `--listen 0.0.0.0` on a LAN, enable a token.
+  The GUI auto-start launches `mcastd` on `0.0.0.0`, so enable auth outside a trusted test network.
 - Plain HTTP over LAN; no HTTPS or user accounts. Use only on a trusted network.
 - Task state is not resumed after a daemon restart: `tasks.json` keeps the tasks, but they return
   to `idle`.
